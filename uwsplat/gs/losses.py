@@ -4,6 +4,8 @@ Images are (H, W, 3) tensors, depth/alpha (H, W, 1).
   reconstruction : (1 - l) L1 + l (1 - SSIM) on the composited underwater image
   depth          : edge-aware smoothness of rendered depth (fixes SeaSplat's signed image
                    gradient), dense prior on the water region, SIFT keypoint depths on the wreck
+  RUSplatting    : edge-aware smoothness of the rendered *image*, switched off across rendered
+                   depth edges (RUSplatting's EdgeSmoothnessLoss, "ESL")
   colour         : grey-world and saturation priors on the restored radiance J
   medium         : dark-pixel backscatter prior, background opacity prior
 """
@@ -48,6 +50,31 @@ def edge_aware_smoothness(depth, alpha, img, gamma=10.0):
     gy = (disp[1:] - disp[:-1]).abs() * (m[1:] * m[:-1])
     wx = torch.exp(-gamma * (img[:, 1:] - img[:, :-1]).abs().mean(-1, keepdim=True))
     wy = torch.exp(-gamma * (img[1:] - img[:-1]).abs().mean(-1, keepdim=True))
+    return (gx * wx).mean() + (gy * wy).mean()
+
+
+def esl_smoothness(image, depth, alpha, beta=5.0, detach=True):
+    """RUSplatting's edge-aware smoothness loss (utils/loss_utils.py EdgeSmoothnessLoss, called with
+    beta=5 and weight 0.05 in train.py; the paper writes lambda_s = 0.2):
+
+        mean |d_x I| exp(-beta |d_x D|) + mean |d_y I| exp(-beta |d_y D|)
+
+    I is the rendered underwater image, D the rendered depth. Their rasteriser outputs accumulated
+    depth (sum z alpha T, 0 where nothing is drawn), so coverage boundaries count as depth edges; here
+    D = expected depth x alpha, divided by the mean depth of the covered pixels, which makes beta
+    independent of the scene scale (uwsplat scenes have median range 1, so the division is ~1).
+
+    detach=True (default) keeps the weights out of the gradient: in the original, lowering the loss by
+    *creating* depth jumps at texture edges is also rewarded. detach=False reproduces RUSplatting."""
+    m = (alpha > 0.5).float()
+    mean_depth = ((depth * m).sum() / m.sum().clamp_min(1.0)).detach().clamp_min(1e-6)
+    D = depth * alpha / mean_depth
+    if detach:
+        D = D.detach()
+    wx = torch.exp(-beta * (D[:, 1:] - D[:, :-1]).abs())
+    wy = torch.exp(-beta * (D[1:] - D[:-1]).abs())
+    gx = (image[:, 1:] - image[:, :-1]).abs()
+    gy = (image[1:] - image[:-1]).abs()
     return (gx * wx).mean() + (gy * wy).mean()
 
 

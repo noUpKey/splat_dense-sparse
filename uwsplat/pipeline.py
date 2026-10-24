@@ -1,4 +1,4 @@
-"""End-to-end stages: sfm -> dense -> fusion -> train -> eval (each reads the previous stage's files)."""
+"""End-to-end stages: sfm -> dense -> fusion -> mvs -> train -> eval (each reads the previous stages' files)."""
 import ast
 import os
 from dataclasses import fields, replace
@@ -8,10 +8,11 @@ from .dense.run import DenseConfig, run_dense
 from .eval.evaluate import evaluate
 from .fusion.fuse import FusionConfig, run_fusion
 from .gs.trainer import TrainConfig, train
+from .mvs.run import MVSConfig, run_mvs
 from .sfm.export import export_sfm
 from .sfm.reconstruct import SfMConfig, run_sfm
 
-STAGES = ("sfm", "dense", "fusion", "train", "eval")
+STAGES = ("sfm", "dense", "fusion", "mvs", "train", "eval")
 
 # Ablations: each is a set of TrainConfig overrides on top of the full method.
 VARIANTS = {
@@ -23,6 +24,17 @@ VARIANTS = {
     "no_appearance": {"appearance": False},
     "baseline_3dgs": {"init": "sparse", "use_medium": False, "appearance": False, "w_dense_depth": 0.0,
                       "w_sparse_depth": 0.0, "w_smooth": 0.0, "sh_degree": 3, "densify": {"water_grad_scale": 1.0}},
+    # RUSplatting's edge-aware smoothness (rendered image, stopped at rendered depth edges), their code's weight
+    "full_esl": {"w_esl": 0.05},
+    # Dense cloud v2 (mvs stage): MVS-verified points on the wreck and textured seabed, network points only where
+    # nothing could be verified, verified depth maps as the dense prior (also on the wreck). `mvs` changes only the
+    # geometry (cloud + prior maps, same loss weights as `full`); the others add one component each.
+    "mvs": {"geometry": "mvs"},
+    "mvs_verified": {"geometry": "mvs", "init": "verified"},          # without the network-only points
+    "mvs_prior": {"geometry": "mvs", "w_dense_depth": 0.1, "depth_decay": 0.3},  # trust verified depth longer
+    "mvs_surfel": {"geometry": "mvs", "surfel_ratio": 0.2},           # Gaussians start as discs on the surface
+    "mvs_esl": {"geometry": "mvs", "w_esl": 0.05},
+    "mvs_all": {"geometry": "mvs", "w_dense_depth": 0.1, "depth_decay": 0.3, "surfel_ratio": 0.2, "w_esl": 0.05},
 }
 
 
@@ -70,6 +82,9 @@ def run_scene(scene_dir: str, out_dir: str, stages=STAGES, sets: dict = None, va
     if "fusion" in stages:
         log("=== multimodal fusion")
         results["fusion"] = run_fusion(out_dir, apply_overrides(FusionConfig(), sets.get("fusion", {})))
+    if "mvs" in stages:
+        log("=== MVS verification (dense cloud v2)")
+        results["mvs"] = run_mvs(out_dir, apply_overrides(MVSConfig(device=device), sets.get("mvs", {})))
     for tag in variants:
         cfg = apply_overrides(TrainConfig(device=device), {**VARIANTS[tag], **sets.get("train", {})})
         if "train" in stages:

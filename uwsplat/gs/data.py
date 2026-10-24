@@ -49,17 +49,27 @@ def _dense_to_image(depth, conf, grid: NetGrid, W, H, s):
     return out[0], out[1]
 
 
+GEOMETRIES = ("fusion", "mvs")  # v1: SIFT wreck + network water cloud | v2: + MVS-verified dense cloud
+
+
+def _prior_grid(out_dir: str, geometry: str):
+    """Grid of the per-view prior maps: the network grid (fusion) or the MVS grid (mvs)."""
+    path = os.path.join(out_dir, "mvs" if geometry == "mvs" else "dense", "summary.json")
+    return NetGrid(**load_json(path)["grid"]) if os.path.exists(path) else None
+
+
 class SceneData:
-    def __init__(self, out_dir: str, device="cuda", downscale: float = 1.0, load_priors: bool = True):
-        self.out_dir, self.device = out_dir, device
+    def __init__(self, out_dir: str, device="cuda", downscale: float = 1.0, load_priors: bool = True,
+                 geometry: str = "fusion"):
+        if geometry not in GEOMETRIES:
+            raise ValueError(f"geometry must be one of {GEOMETRIES}, got {geometry!r}")
+        self.out_dir, self.device, self.geometry = out_dir, device, geometry
         meta = load_json(os.path.join(out_dir, "sfm", "scene.json"))
         pin = PinholeCamera.from_dict(meta["camera"])
         W, H = int(round(pin.width / downscale)), int(round(pin.height / downscale))
         s = W / pin.width
         K = pin.scaled(W, H).K
-        grid = None
-        if load_priors and os.path.exists(os.path.join(out_dir, "dense", "summary.json")):
-            grid = NetGrid(**load_json(os.path.join(out_dir, "dense", "summary.json"))["grid"])
+        grid = _prior_grid(out_dir, geometry) if load_priors else None
         v, u = np.meshgrid(np.arange(H) + 0.5, np.arange(W) + 0.5, indexing="ij")
         rays = np.stack([u, v, np.ones_like(u)], -1) @ np.linalg.inv(K).T
         ray_norm = np.linalg.norm(rays, axis=-1, keepdims=True)
@@ -82,11 +92,13 @@ class SceneData:
                         torch.from_numpy(img).float().div(255).to(device),
                         torch.tensor(dirs, dtype=torch.float32, device=device),
                         torch.tensor(ray_norm, dtype=torch.float32, device=device))
-            mpath = os.path.join(out_dir, "fusion", "masks", stem + ".png")
-            if os.path.exists(mpath):
-                m = cv2.resize(cv2.imread(mpath, cv2.IMREAD_GRAYSCALE), (W, H), interpolation=cv2.INTER_NEAREST)
-                view.wreck = torch.from_numpy(m > 127).to(device)
-            ppath = os.path.join(out_dir, "fusion", "priors", stem + ".npz")
+            for gdir in dict.fromkeys((geometry,) + GEOMETRIES):  # same SIFT-support masks in both stages
+                mpath = os.path.join(out_dir, gdir, "masks", stem + ".png")
+                if os.path.exists(mpath):
+                    m = cv2.resize(cv2.imread(mpath, cv2.IMREAD_GRAYSCALE), (W, H), interpolation=cv2.INTER_NEAREST)
+                    view.wreck = torch.from_numpy(m > 127).to(device)
+                    break
+            ppath = os.path.join(out_dir, geometry, "priors", stem + ".npz")
             if im["split"] == "train":
                 view.train_id = n_train
                 n_train += 1
@@ -107,10 +119,15 @@ class SceneData:
         self.meta = meta
 
     def points(self, kind: str = "fused"):
-        """Initial point cloud: 'fused' (SIFT wreck + dense water), 'sparse' or 'dense'."""
-        ply = read_ply(os.path.join(self.out_dir, "fusion", "fused.ply"))
+        """Initial point cloud of this geometry: xyz, rgb, source tag and normals (zeros where unknown).
+
+        kind: 'fused' (everything), 'sparse' (SIFT only), 'dense' (everything but SIFT),
+        'verified' (SIFT + MVS-verified, i.e. without the network-only points; mvs geometry)."""
+        ply = read_ply(os.path.join(self.out_dir, self.geometry, "fused.ply"))
         xyz = np.stack([ply["x"], ply["y"], ply["z"]], 1).astype(np.float64)
         rgb = np.stack([ply["red"], ply["green"], ply["blue"]], 1) / 255.0
         src = ply["source"].astype(np.uint8)
-        keep = {"fused": np.ones(len(src), bool), "sparse": src == 0, "dense": src == 1}[kind]
-        return xyz[keep], rgb[keep], src[keep]
+        nrm = np.stack([ply["nx"], ply["ny"], ply["nz"]], 1).astype(np.float64) if "nx" in ply else np.zeros_like(xyz)
+        keep = {"fused": np.ones(len(src), bool), "sparse": src == 0, "dense": src >= 1,
+                "verified": src != 1}[kind]
+        return xyz[keep], rgb[keep], src[keep], nrm[keep]

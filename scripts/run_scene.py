@@ -20,6 +20,6 @@ if __name__ == "__main__":
     p.add_argument("--variants", default="full", help=f"comma list from {sorted(VARIANTS)}")
     p.add_argument("--device", default="cuda")
     p.add_argument("--set", action="append", default=[], metavar="SECTION.KEY=VALUE",
-                   help="config override, sections: sfm, dense, fusion, train (repeatable)")
+                   help="config override, sections: sfm, dense, fusion, mvs, train (repeatable)")
     a = p.parse_args()
     run_scene(a.scene, a.out, a.stages.split(","), parse_sets(a.set), a.variants.split(","), a.device)

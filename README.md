@@ -110,6 +110,53 @@ No GPU was available here, so **the PSNR/SSIM/LPIPS of the real configuration (7
 Tests: `python -m tests.test_bundle`, `python -m tests.test_medium_compositing`,
 `python -m tests.test_dense_equivalence <dust3r_repo> <ckpt> <img1> <img2>`, and `python -m tests.test_smoke_train outputs/<scene>`.
 
+## Dense cloud v2: MVS-verified geometry (`mvs` stage)
+
+**Why.** What the earlier runs say about the initial geometry:
+
+| Test | Result | Consequence for the cloud |
+|---|---|---|
+| uwsplat v1 vs RUSplatting (A40, Oct 23) | Isro: PSNR +0.84 dB, yet LPIPS 0.360 vs 0.251 and SSIM 0.839 vs 0.870; only 0.29–0.40M Gaussians on Isro / Kwaj | renders are too smooth: too few small Gaussians where the texture is |
+| fusion v1 routing | wreck pixels get SIFT points only (13.8k on Isro, 16.1k on Tokai) | the most textured region starts the sparsest |
+| DUSt3R depth vs SfM (Isro) | 6.3 % median error after fusion | texture lands several pixels off in neighbouring views |
+| VGGT → 3DGS (A40, Oct 24) | 19.45 dB, SSIM 0.45 (Tokai 17.6 dB) | network geometry alone cannot place texture |
+| zero-weight interpolated frames (RUSplatting) | +0.85 / +0.89 dB from extra COLMAP tracks only; LPIPS not better | triangulated points help, but they have to be dense too |
+| train-vs-test gap, SH truncation | 11–20 dB gap; the degree-3 band memorises; each Gaussian's colour varies 10–14/255 across training views | geometry errors are absorbed as view-dependent colour, so geometry needs a prior that also holds in novel views |
+| pruning / water tests | single-view Gaussians cover the never-seen strip; frustum pruning −1.0 dB; learned water +0.42 dB | add no point that two training views cannot verify; open water stays with the medium |
+
+**What it does** (`uwsplat/mvs`, training views only):
+1. Every textured pixel of every training view is *re-measured* by a plane sweep with the SfM poses: 4 source views, 7×7 zero-mean NCC, sub-sample peak. The network depth is only the centre of a ±22 % search band (`prior` pass); pixels without a usable prior get a sweep over the view's SIFT depth range (`wide` pass, the only pass without the dense stage). Hypotheses are spaced so the widest-baseline source moves ≤ 0.75 grid px per step.
+2. **Water does not break the matching.** Within a window at one range, water acts as a gain (attenuation `e^(−β_D r)`) plus an offset (backscatter `B∞(1−e^(−β_B r))`), and exposure / white balance as another gain; zero-mean NCC cancels both. What water does destroy is contrast, so a texture gate (window std ≥ 2 grey levels) refuses open water.
+3. Multi-view geometric consistency (1.5 %) between the independently measured depth maps, with consensus snapping.
+4. Classes: **verified** (dense points, wreck included), **completed** (network points, exactly as v1, only where nothing was verified but v1 routing sees a surface), **open water** (no points, medium).
+5. Outputs: `mvs/fused.ply` (`source` 0 SIFT / 1 network-only / 2 verified, NCC score, #views, surface normals), per-view depth priors (weight 1.0 verified, 0.3 network-only), wreck masks, medium start (copied from fusion, so v1 and v2 differ only in geometry), `viz/`, `summary.json`.
+
+**Training options** (`TrainConfig`): `geometry="mvs"` (cloud + priors from `mvs/`), `init="verified"` (drop network-only points), `surfel_ratio` (Gaussians with a normal start as discs on the surface), `init_opacity_verified`, `scene_scale` (override of the 1.1 × camera-radius extent that scales the position lr and the densify / prune thresholds; scenes are in median-range units), and RUSplatting's edge-aware smoothness `w_esl` / `esl_beta` / `esl_detach`.
+
+**RUSplatting's "edge smoothness"** (`gs/losses.py: esl_smoothness`) is ported from their code (`EdgeSmoothnessLoss(beta=5)`, weight 0.05; the paper writes λ_s = 0.2 and reports SSIM 0.7306 → 0.7491, PSNR 24.67 → 25.03). It smooths the **rendered image** wherever the **rendered depth** is smooth (weights `exp(−5 |∇D|)`, D = accumulated depth like their rasteriser's), so it denoises surfaces and stops at depth edges. It is a different term from uwsplat's existing edge-aware *depth* smoothness (`w_smooth`), which smooths depth except at image edges; both can run together. By default the weights are detached (`esl_detach=True`): in the original, creating depth jumps at texture edges also lowers the loss. `esl_detach=False` reproduces RUSplatting exactly.
+
+**Measured without a GPU** (real Submerged3D frames, our SfM, MVS grid 640×360, *no network prior*: the sandbox could not download the DUSt3R weights, so only the wide pass ran):
+
+| | Isro | Tokai |
+|---|---|---|
+| verified pixels: all / wreck / off-wreck | 44 % / **87 %** / 19 % | 58 % / **85 %** / 40 % |
+| points: SIFT + verified | 13,777 + 591,928 | 16,149 + 562,345 |
+| depth vs SIFT triangulations (median / p90; within 1 %) | **0.44 %** / 1.65 %; 79 % | **0.21 %** / 0.60 %; 97 % |
+| held-out test views, mean NCC on wreck pixels: SIFT-interpolated / verified | 0.819 / **0.850** | 0.865 / **0.876** |
+| held-out NCC, verified with a smooth ±6 % (network-sized) error / exact | 0.627 / 0.847 | 0.274 / 0.859 |
+| time on 2 CPU cores | 6.8 min | 10.7 min |
+
+`scripts/heldout_geometry.py` produces the held-out rows: test images are warped into their nearest training views with each candidate depth map and compared by NCC (scoring only, like PSNR). On a synthetic underwater plane with range-dependent attenuation and backscatter, ±15 % exposure changes and noise, the sweep recovers depth to 0.13 % median (p90 0.32 %) and verifies none of the flat water-like region (`tests/test_mvs.py`).
+
+**On the A40** (stage outputs are cached, the `mvs` stage runs once per scene):
+```bash
+python scripts/run_all.py --data Submerged3D --out outputs --variants full,mvs \
+       --set train.scene_scale=0.8                                  # v1 vs v2 geometry, all else equal
+python scripts/heldout_geometry.py --out outputs/Tokai                # adds the real network-depth row
+python scripts/run_all.py --data Submerged3D --out outputs \
+       --variants mvs_prior,mvs_surfel,mvs_esl,full_esl,mvs_all --set train.scene_scale=0.8
+```
+
 ## Outputs (`outputs/<scene>/`)
 
 ```
@@ -120,6 +167,8 @@ dense/<frame>.npz, viz/     fused, consensus depth + confidence + consistency pe
 fusion/fused.ply            multimodal cloud (source 0 = SIFT/wreck, 1 = dense/water)
 fusion/viz/, masks/         routing overlays (red wreck, green water surface, blue open water)
 fusion/medium_init.json     data-driven B∞, β_B, β_D
+mvs/fused.ply               dense cloud v2 (source 0 = SIFT, 1 = network-only, 2 = MVS-verified; normals)
+mvs/priors/, masks/, viz/   verified depth priors, wreck masks, class overlays (red verified, green network, blue water)
 gs/<variant>/               ckpt.pt, point_cloud.ply (standard 3DGS PLY, restored colours), train_log.jsonl
 eval/<variant>/             metrics.json, renders/, gt/, restored/, depth/, montage/
 ```
@@ -135,6 +184,13 @@ eval/<variant>/             metrics.json, renders/, gt/, restored/, depth/, mont
 | `no_depth_priors` | SIFT + dense | ✓ | ✗ | |
 | `no_appearance` | SIFT + dense | ✓ | ✓ | no per-image colour correction |
 | `baseline_3dgs` | SIFT only | ✗ | ✗ | SH degree 3; plain 3DGS on our SfM |
+| `full_esl` | SIFT + dense | ✓ | ✓ | + RUSplatting edge-aware image smoothness (`w_esl` 0.05) |
+| `mvs` | SIFT + MVS-verified + network-only (v2) | ✓ | ✓ (verified depth, also on the wreck) | v2 geometry, same loss weights as `full` |
+| `mvs_verified` | SIFT + MVS-verified | ✓ | ✓ | v2 without the network-only points |
+| `mvs_prior` | v2 | ✓ | ✓ stronger (0.1, decays to 30 %) | trusts the verified depth for longer |
+| `mvs_surfel` | v2, discs on the surface | ✓ | ✓ | `surfel_ratio` 0.2 |
+| `mvs_esl` | v2 | ✓ | ✓ | + RUSplatting edge-aware image smoothness |
+| `mvs_all` | v2, discs | ✓ | ✓ stronger | prior + surfel + ESL |
 
 Reference averages on Submerged3D (reported by the papers, not re-run): RUSplatting paper 25.80 / 0.7724 / 0.3008; COLMAP→3DGS 23.48 / 0.7385 / 0.3333 at 720p (Caldeira et al. 2026). Your earlier RUSplatting Colab runs gave, for example, Tokai 24.38 / 0.7347 / 0.3523 and Cormoran 21.16 / 0.6788 / 0.3415 (base config).
 
