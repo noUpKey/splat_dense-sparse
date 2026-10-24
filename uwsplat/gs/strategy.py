@@ -56,6 +56,9 @@ class DensifyStrategy:
         return stats
 
     def _accumulate(self, params, state, info):
+        if self.absgrad and getattr(info["means2d"], "absgrad", None) is None and info["means2d"].grad is not None:
+            raise RuntimeError("absgrad=True but the rasteriser did not provide means2d.absgrad "
+                               "(render(..., absgrad=strategy.absgrad) must be passed through)")
         g = info["means2d"].absgrad if self.absgrad else info["means2d"].grad
         if g is None:
             return

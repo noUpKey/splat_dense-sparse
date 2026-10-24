@@ -171,6 +171,23 @@ python scripts/run_all.py --data Submerged3D --out outputs \
        --variants mvs_prior,mvs_surfel,mvs_esl,full_esl,mvs_all --set train.scene_scale=0.8
 ```
 
+## Held-out view check: test-view colour correction (`scripts/heldout_appearance.py`)
+
+Training fits an affine colour correction per training image (exposure and white balance change by 6–16 % between
+consecutive Submerged3D frames); test views are rendered with the average correction (`identity`), which is what
+`metrics.json` reports. The check re-scores a trained run without retraining under other choices, none of which uses
+test pixels: `neighbors` (interpolated in time between the training frames before and after the test frame; the
+nearest one at a sequence end) and `nearest_pose` (the nearest training camera). `oracle` fits the correction to the
+test image itself: an upper bound on what any global colour correction could gain, not a result. The same predictions
+are scored leave-one-out on the training views, where the true correction is known. Each test pixel is also marked
+seen / never seen (its rendered surface point, or its direction where the render is open water, lands inside some
+training image; occlusion ignored), and PSNR is split accordingly.
+
+```bash
+python scripts/heldout_appearance.py --out outputs --scenes Tokai,Cormoran,Isro,Kwaj \
+       --variants mvs,mvs_lpips --per-view mvs_lpips      # -> eval/<variant>/heldout_appearance.json + table
+```
+
 ## Outputs (`outputs/<scene>/`)
 
 ```
@@ -184,7 +201,7 @@ fusion/medium_init.json     data-driven B∞, β_B, β_D
 mvs/fused.ply               dense cloud v2 (source 0 = SIFT, 1 = network-only, 2 = MVS-verified; normals)
 mvs/priors/, masks/, viz/   verified depth priors, wreck masks, class overlays (red verified, green network, blue water)
 gs/<variant>/               ckpt.pt, point_cloud.ply (standard 3DGS PLY, restored colours), train_log.jsonl
-eval/<variant>/             metrics.json, renders/, gt/, restored/, depth/, montage/
+eval/<variant>/             metrics.json, renders/, gt/, restored/, depth/, montage/, heldout_appearance.json
 ```
 
 ## Variants (`--variants`)
@@ -207,6 +224,18 @@ eval/<variant>/             metrics.json, renders/, gt/, restored/, depth/, mont
 | `mvs_all` | v2, discs | ✓ | ✓ stronger | prior + surfel + ESL |
 | `full_lpips` | SIFT + dense | ✓ | ✓ | + LPIPS-VGG loss (0.05) from step 15000 |
 | `mvs_lpips` | v2 | ✓ | ✓ | + LPIPS-VGG loss (0.05) from step 15000 |
+
+Components, combined with `+` (left to right; later keys win, `densify` settings merge), e.g.
+`--variants mvs_lpips+abs,mvs_lpips+prior`. The tag, `+` included, is the run's folder name; a new combination needs
+no code change.
+
+| Component | Change |
+|---|---|
+| `abs` | AbsGS densification: split / clone by absolute screen-space gradients, threshold 0.0008 (gsplat's advice for absgrad) |
+| `prior` | verified depth prior 0.1, decaying to 30 % (as `mvs_prior`) |
+| `surfel` | `surfel_ratio` 0.2 (as `mvs_surfel`) |
+| `lpips`, `lpipsx2`, `lpips10k` | LPIPS loss 0.05 from 15k / 0.1 from 15k / 0.05 from 10k |
+| `esl`, `sh3` | RUSplatting ESL 0.05 / SH degree 3 |
 
 Reference averages on Submerged3D (reported by the papers, not re-run): RUSplatting paper 25.80 / 0.7724 / 0.3008; COLMAP→3DGS 23.48 / 0.7385 / 0.3333 at 720p (Caldeira et al. 2026). Your earlier RUSplatting Colab runs gave, for example, Tokai 24.38 / 0.7347 / 0.3523 and Cormoran 21.16 / 0.6788 / 0.3415 (base config).
 

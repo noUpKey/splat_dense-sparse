@@ -38,7 +38,37 @@ VARIANTS = {
     # LPIPS-VGG as a training loss (weight 0.05), switched on at step 15000 (lpips_from) with a 1000-step ramp
     "full_lpips": {"w_lpips": 0.05},
     "mvs_lpips": {"geometry": "mvs", "w_lpips": 0.05},
+    # Components, meant to be combined with '+' (see resolve_variant): "mvs_lpips+abs" = mvs_lpips with AbsGS
+    # densification. On its own each one is a change on top of `full`.
+    "abs": {"densify": {"absgrad": True, "grow_grad2d": 0.0008}},  # AbsGS: split by absolute screen-space
+                                                                    # gradients (gsplat's advice: 4x threshold)
+    "prior": {"w_dense_depth": 0.1, "depth_decay": 0.3},          # = mvs_prior's change
+    "surfel": {"surfel_ratio": 0.2},                               # = mvs_surfel's change
+    "esl": {"w_esl": 0.05},
+    "lpips": {"w_lpips": 0.05},
+    "lpips10k": {"w_lpips": 0.05, "lpips_from": 10_000},           # LPIPS before densification ends
+    "lpipsx2": {"w_lpips": 0.1},
+    "sh3": {"sh_degree": 3},
 }
+
+
+def _merge(over: dict, extra: dict) -> dict:
+    out = dict(over)
+    for k, v in extra.items():
+        out[k] = {**out.get(k, {}), **v} if k == "densify" and isinstance(v, dict) else v
+    return out
+
+
+def resolve_variant(tag: str) -> dict:
+    """TrainConfig overrides of a variant. 'a+b+c' combines variants from left to right: later keys win and the
+    `densify` dicts are merged, e.g. 'mvs_lpips+abs' = mvs_lpips with AbsGS densification. The tag (with its '+')
+    is also the run's folder name."""
+    over = {}
+    for part in tag.split("+"):
+        if part not in VARIANTS:
+            raise KeyError(f"unknown variant {part!r} in {tag!r}; known: {', '.join(sorted(VARIANTS))}")
+        over = _merge(over, VARIANTS[part])
+    return over
 
 
 def apply_overrides(cfg, overrides: dict):
@@ -89,7 +119,7 @@ def run_scene(scene_dir: str, out_dir: str, stages=STAGES, sets: dict = None, va
         log("=== MVS verification (dense cloud v2)")
         results["mvs"] = run_mvs(out_dir, apply_overrides(MVSConfig(device=device), sets.get("mvs", {})))
     for tag in variants:
-        cfg = apply_overrides(TrainConfig(device=device), {**VARIANTS[tag], **sets.get("train", {})})
+        cfg = apply_overrides(TrainConfig(device=device), _merge(resolve_variant(tag), sets.get("train", {})))
         if "train" in stages:
             log(f"=== medium-aware Gaussian splatting [{tag}]")
             results[f"train/{tag}"] = train(out_dir, cfg, tag)

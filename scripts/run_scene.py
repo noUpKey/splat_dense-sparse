@@ -10,16 +10,19 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from uwsplat.pipeline import STAGES, VARIANTS, parse_sets, run_scene  # noqa: E402
+from uwsplat.pipeline import STAGES, VARIANTS, parse_sets, resolve_variant, run_scene  # noqa: E402
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--scene", required=True, help="scene folder containing input/ (e.g. Submerged3D/Tokai)")
     p.add_argument("--out", required=True, help="output folder for this scene")
     p.add_argument("--stages", default=",".join(STAGES), help=f"comma list from {STAGES}")
-    p.add_argument("--variants", default="full", help=f"comma list from {sorted(VARIANTS)}")
+    p.add_argument("--variants", default="full",
+                   help=f"comma list from {sorted(VARIANTS)}; join with '+' to combine (mvs_lpips+abs)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--set", action="append", default=[], metavar="SECTION.KEY=VALUE",
                    help="config override, sections: sfm, dense, fusion, mvs, train (repeatable)")
     a = p.parse_args()
+    for v in a.variants.split(","):
+        resolve_variant(v)  # unknown names fail here, before any stage runs
     run_scene(a.scene, a.out, a.stages.split(","), parse_sets(a.set), a.variants.split(","), a.device)

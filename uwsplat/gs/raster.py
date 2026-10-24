@@ -17,7 +17,8 @@ def rasterize(means, quats, scales, opacities, colors, viewmats, Ks, width, heig
         from gsplat import rasterization
         return rasterization(means, quats, scales, opacities, colors, viewmats, Ks, width, height,
                              near_plane=near_plane, render_mode="RGB+ED", packed=False, absgrad=absgrad)
-    return torch_rasterize(means, quats, scales, opacities, colors, viewmats, Ks, width, height, near_plane)
+    return torch_rasterize(means, quats, scales, opacities, colors, viewmats, Ks, width, height, near_plane,
+                           absgrad=absgrad)
 
 
 def _quat_to_rotmat(q):
@@ -28,7 +29,8 @@ def _quat_to_rotmat(q):
         2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1).reshape(-1, 3, 3)
 
 
-def torch_rasterize(means, quats, scales, opacities, colors, viewmats, Ks, W, H, near_plane=0.01, eps2d=0.3):
+def torch_rasterize(means, quats, scales, opacities, colors, viewmats, Ks, W, H, near_plane=0.01, eps2d=0.3,
+                    absgrad=False):
     assert viewmats.shape[0] == 1, "reference rasteriser renders one camera at a time"
     Rc, tc, K = viewmats[0, :3, :3], viewmats[0, :3, 3], Ks[0]
     pc = means @ Rc.T + tc
@@ -60,6 +62,14 @@ def torch_rasterize(means, quats, scales, opacities, colors, viewmats, Ks, W, H,
     pix = torch.stack([xx, yy], -1).reshape(-1, 2)
     order = torch.argsort(torch.where(valid, z, torch.full_like(z, 1e10)))
     d = pix[None] - means2d[0][order][:, None]
+    if absgrad and d.requires_grad:
+        # gsplat's absgrad: per Gaussian, the sum over pixels of |dL/d means2d| taken pixel by pixel (AbsGS). All
+        # of means2d's gradient flows through d, so the per-pixel terms are exactly d's gradient.
+        def _absgrad(g, order=order, m2d=means2d):
+            ab = torch.zeros_like(m2d[0])
+            ab[order] = g.abs().sum(1)
+            m2d.absgrad = ab[None]
+        d.register_hook(_absgrad)
     a, b, c = conic[order].unbind(-1)
     sigma = 0.5 * (a[:, None] * d[..., 0] ** 2 + c[:, None] * d[..., 1] ** 2) + b[:, None] * d[..., 0] * d[..., 1]
     alpha = (opacities[order][:, None] * torch.exp(-sigma)).clamp(max=0.999)
