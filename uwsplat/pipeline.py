@@ -35,6 +35,9 @@ VARIANTS = {
     "mvs_surfel": {"geometry": "mvs", "surfel_ratio": 0.2},           # Gaussians start as discs on the surface
     "mvs_esl": {"geometry": "mvs", "w_esl": 0.05},
     "mvs_all": {"geometry": "mvs", "w_dense_depth": 0.1, "depth_decay": 0.3, "surfel_ratio": 0.2, "w_esl": 0.05},
+    # LPIPS-VGG as a training loss (weight 0.05), switched on at step 15000 (lpips_from) with a 1000-step ramp
+    "full_lpips": {"w_lpips": 0.05},
+    "mvs_lpips": {"geometry": "mvs", "w_lpips": 0.05},
 }
 
 

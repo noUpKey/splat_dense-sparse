@@ -135,6 +135,20 @@ Tests: `python -m tests.test_bundle`, `python -m tests.test_medium_compositing`,
 
 **RUSplatting's "edge smoothness"** (`gs/losses.py: esl_smoothness`) is ported from their code (`EdgeSmoothnessLoss(beta=5)`, weight 0.05; the paper writes λ_s = 0.2 and reports SSIM 0.7306 → 0.7491, PSNR 24.67 → 25.03). It smooths the **rendered image** wherever the **rendered depth** is smooth (weights `exp(−5 |∇D|)`, D = accumulated depth like their rasteriser's), so it denoises surfaces and stops at depth edges. It is a different term from uwsplat's existing edge-aware *depth* smoothness (`w_smooth`), which smooths depth except at image edges; both can run together. By default the weights are detached (`esl_detach=True`): in the original, creating depth jumps at texture edges also lowers the loss. `esl_detach=False` reproduces RUSplatting exactly.
 
+**Training loss** (`gs/trainer.py`: every term goes into the dict `L`, then `loss = sum(L.values())`):
+
+```
+L = (0.8 L1 + 0.2 (1 - SSIM))(render, photo)                     render = Gaussians through the medium + water + appearance
+  + d(t) (0.05 L_dense + 0.05 L_sparse)                          log-depth priors, d(t) = 0.1^(t/T)
+  + 0.01 L_smooth + w_esl L_esl                                   depth smoothness / RUSplatting image smoothness (w_esl 0)
+  + [t >= 3000] (0.01 L_grey + 0.1 L_sat)                         restored colour J
+  + [t >= 500] (0.05 L_backscatter + 0.01 L_bg_opacity)           water parameters, open-water transparency
+  + 0.1 L_appearance
+  + [t >= lpips_from] min(1, (t - lpips_from + 1) / lpips_ramp) w_lpips LPIPS(render, photo)
+```
+
+The perceptual term is off by default (`w_lpips = 0`). The `*_lpips` variants switch it on with weight 0.05 at step 15000, which is when densification stops: from there it refines the Gaussians that exist without driving splits. It ramps in over 1000 steps, scores one random 512×512 crop per step, and uses a frozen LPIPS-VGG (`lpips_net="alex"` trains on a network other than the evaluation's). Starting it earlier (`--set train.lpips_from=10000`) lets its gradients also steer densification.
+
 **Measured without a GPU** (real Submerged3D frames, our SfM, MVS grid 640×360, *no network prior*: the sandbox could not download the DUSt3R weights, so only the wide pass ran):
 
 | | Isro | Tokai |
@@ -191,6 +205,8 @@ eval/<variant>/             metrics.json, renders/, gt/, restored/, depth/, mont
 | `mvs_surfel` | v2, discs on the surface | ✓ | ✓ | `surfel_ratio` 0.2 |
 | `mvs_esl` | v2 | ✓ | ✓ | + RUSplatting edge-aware image smoothness |
 | `mvs_all` | v2, discs | ✓ | ✓ stronger | prior + surfel + ESL |
+| `full_lpips` | SIFT + dense | ✓ | ✓ | + LPIPS-VGG loss (0.05) from step 15000 |
+| `mvs_lpips` | v2 | ✓ | ✓ | + LPIPS-VGG loss (0.05) from step 15000 |
 
 Reference averages on Submerged3D (reported by the papers, not re-run): RUSplatting paper 25.80 / 0.7724 / 0.3008; COLMAP→3DGS 23.48 / 0.7385 / 0.3333 at 720p (Caldeira et al. 2026). Your earlier RUSplatting Colab runs gave, for example, Tokai 24.38 / 0.7347 / 0.3523 and Cormoran 21.16 / 0.6788 / 0.3415 (base config).
 

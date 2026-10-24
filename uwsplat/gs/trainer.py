@@ -11,8 +11,8 @@ import torch
 from ..common.io import load_json, log, save_json
 from .appearance import Appearance
 from .data import SceneData
-from .losses import (background_opacity, backscatter_prior, dense_depth_prior, edge_aware_smoothness, esl_smoothness,
-                     gray_world, reconstruction, saturation, sparse_depth_prior)
+from .losses import (PerceptualLoss, background_opacity, backscatter_prior, dense_depth_prior, edge_aware_smoothness,
+                     esl_smoothness, gray_world, reconstruction, saturation, sparse_depth_prior)
 from .medium import WaterMedium
 from .model import DENSE, VERIFIED, export_ply, init_params
 from .render import render
@@ -56,6 +56,11 @@ class TrainConfig:
     w_esl: float = 0.0               # RUSplatting edge-aware smoothness of the rendered image (their code: 0.05)
     esl_beta: float = 5.0
     esl_detach: bool = True          # False = exactly RUSplatting (depth edges are rewarded, see losses.py)
+    w_lpips: float = 0.0             # > 0: LPIPS(render, photo) on training views (perceptual loss)
+    lpips_from: int = 15_000         # switched on late: densification has stopped (refine_stop) and geometry is set
+    lpips_ramp: int = 1000           # the weight rises linearly over this many steps (no jump for Adam)
+    lpips_net: str = "vgg"           # vgg = the evaluation network; alex = a perceptual loss that is not the metric
+    lpips_crop: int = 512            # one random crop x crop window per step (0 = whole image)
     w_gray_world: float = 0.01
     w_saturation: float = 0.1
     color_from: int = 3000
@@ -157,6 +162,15 @@ def train(out_dir: str, cfg: TrainConfig, tag: str = "full") -> dict:
     app_opt = torch.optim.Adam(appearance.parameters(), lr=cfg.lr_appearance) if appearance is not None else None
     strategy = DensifyStrategy(**cfg.densify)
     state = strategy.initialize_state(scene_scale, torch.tensor(src, device=dev))
+    perceptual = None
+    if cfg.w_lpips > 0:
+        if cfg.lpips_from >= cfg.iterations:
+            log(f"[{tag}] WARNING: w_lpips > 0 but lpips_from ({cfg.lpips_from}) >= iterations ({cfg.iterations}): "
+                f"the perceptual loss never switches on")
+        perceptual = PerceptualLoss(cfg.lpips_net, cfg.lpips_crop, dev, cfg.seed)
+        log(f"[{tag}] LPIPS-{cfg.lpips_net} loss x {cfg.w_lpips} from step {cfg.lpips_from} "
+            f"(ramp {cfg.lpips_ramp}, crop {cfg.lpips_crop or 'full image'}); densification stops at "
+            f"{strategy.refine_stop}")
 
     log_f = open(os.path.join(gs_dir, "train_log.jsonl"), "w")
     order, t0, ema = [], time.time(), None
@@ -181,6 +195,9 @@ def train(out_dir: str, cfg: TrainConfig, tag: str = "full") -> dict:
             L["smooth"] = cfg.w_smooth * edge_aware_smoothness(depth, alpha, gt)
         if cfg.w_esl > 0:
             L["esl"] = cfg.w_esl * esl_smoothness(out["image"], depth, alpha, cfg.esl_beta, cfg.esl_detach)
+        if perceptual is not None and step >= cfg.lpips_from:
+            ramp = min(1.0, (step - cfg.lpips_from + 1) / max(cfg.lpips_ramp, 1))
+            L["lpips"] = cfg.w_lpips * ramp * perceptual(out["image"], gt)
         if medium is not None:
             if step >= cfg.color_from:
                 L["gray"] = cfg.w_gray_world * gray_world(out["restored"], alpha)
