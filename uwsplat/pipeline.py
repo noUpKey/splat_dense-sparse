@@ -49,6 +49,8 @@ VARIANTS = {
     "lpips10k": {"w_lpips": 0.05, "lpips_from": 10_000},           # LPIPS before densification ends
     "lpipsx2": {"w_lpips": 0.1},
     "sh3": {"sh_degree": 3},
+    "fs": {"forward_scatter": True},                               # forward scattering (gs/scatter.py)
+    "fs3k": {"forward_scatter": True, "fs_from": 3000},            # ... switched on after the warm-up
 }
 
 

@@ -188,6 +188,16 @@ python scripts/heldout_appearance.py --out outputs --scenes Tokai,Cormoran,Isro,
        --variants mvs,mvs_lpips --per-view mvs_lpips      # -> eval/<variant>/heldout_appearance.json + table
 ```
 
+## Forward scattering (`fs` component, `uwsplat/gs/scatter.py`)
+
+Small-angle scattering blurs a surface's image by an angle that grows with the path length r. Each Gaussian keeps its
+sharp shape; for every view the renderer widens it in 3D by b = kappa * r * z (so the image blur is kappa * r radians)
+and scales its opacity by sqrt(det Sigma_2D / det Sigma_2D') so its integrated footprint is unchanged. kappa is one
+learned scalar per scene (in the medium's optimizer and checkpoint). No CUDA change. `--variants mvs_lpips+fs`
+(blur from step 0) or `mvs_lpips+fs3k` (from step 3000); `fs_kappa` is logged in train_log.jsonl and final.json.
+`tests/test_scatter.py`: no-op at kappa -> 0, summed alpha preserved (0.96 with the 1/255 alpha cut-off), angular
+blur proportional to range, gradients reach kappa.
+
 ## SeaThru-NeRF (the data SeaSplat evaluates on): `scripts/prepare_seathru.py`
 
 Prepares the SeaThru-NeRF scenes the way 3DGS-based methods receive them (SeaSplat: undistorted images + `sparse/0`):

@@ -14,6 +14,7 @@ from .data import SceneData
 from .losses import (PerceptualLoss, background_opacity, backscatter_prior, dense_depth_prior, edge_aware_smoothness,
                      esl_smoothness, gray_world, reconstruction, saturation, sparse_depth_prior)
 from .medium import WaterMedium
+from .scatter import ForwardScatter
 from .model import DENSE, VERIFIED, export_ply, init_params
 from .render import render
 from .strategy import DensifyStrategy
@@ -56,6 +57,9 @@ class TrainConfig:
     w_esl: float = 0.0               # RUSplatting edge-aware smoothness of the rendered image (their code: 0.05)
     esl_beta: float = 5.0
     esl_detach: bool = True          # False = exactly RUSplatting (depth edges are rewarded, see losses.py)
+    forward_scatter: bool = False    # range-dependent blur per Gaussian (gs/scatter.py), kappa learned
+    fs_kappa_init: float = 3e-4      # angular blur = kappa x range (radians, scene units)
+    fs_from: int = 0                 # step from which the blur is applied
     w_lpips: float = 0.0             # > 0: LPIPS(render, photo) on training views (perceptual loss)
     lpips_from: int = 15_000         # switched on late: densification has stopped (refine_stop) and geometry is set
     lpips_ramp: int = 1000           # the weight rises linearly over this many steps (no jump for Adam)
@@ -147,6 +151,8 @@ def train(out_dir: str, cfg: TrainConfig, tag: str = "full") -> dict:
     if cfg.use_medium:
         medium = WaterMedium(mi["binf"], mi["beta_d"], mi["beta_b"], cfg.binf_degree).to(dev)
         rgb = restored_colors(xyz, rgb, data, medium)
+        if cfg.forward_scatter:
+            medium.scatter = ForwardScatter(cfg.fs_kappa_init).to(dev)  # in the medium optimizer and checkpoint
         extra_opt = torch.optim.Adam(medium.parameters(), lr=cfg.lr_medium)
     else:
         bg = torch.nn.Parameter(torch.logit(torch.tensor(mi["binf"], dtype=torch.float32, device=dev).clamp(0.01, 0.99)))
@@ -181,6 +187,8 @@ def train(out_dir: str, cfg: TrainConfig, tag: str = "full") -> dict:
         view = data.train[order.pop()]
         sh_deg = min(step // cfg.sh_increase_every, cfg.sh_degree)
         bg_rgb = torch.sigmoid(bg) if bg is not None else None
+        if medium is not None and hasattr(medium, "scatter"):
+            medium.scatter.active = step >= cfg.fs_from
         out = render(params, view, medium, sh_deg, cfg.backend, strategy.absgrad, appearance, bg_rgb)
         strategy.step_pre_backward(out["meta"])
         gt, depth, alpha = view.image, out["depth"], out["alpha"]
@@ -232,6 +240,8 @@ def train(out_dir: str, cfg: TrainConfig, tag: str = "full") -> dict:
             if medium is not None:
                 rec["beta_d"] = [round(x, 4) for x in medium.beta_d.tolist()]
                 rec["beta_b"] = [round(x, 4) for x in medium.beta_b.tolist()]
+                if hasattr(medium, "scatter"):
+                    rec["fs_kappa"] = float(medium.scatter.kappa)
             # step 0 included: test PSNR of the initial cloud alone (v1 vs v2 initialisation)
             if cfg.eval_every and (step % cfg.eval_every == 0 or step == cfg.iterations - 1) and data.test:
                 rec["test_psnr"] = quick_psnr(params, data.test, medium, sh_deg, cfg, bg_rgb)

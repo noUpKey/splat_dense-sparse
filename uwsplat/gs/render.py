@@ -21,7 +21,11 @@ def render(params, view, medium=None, sh_degree: int = 0, backend: str = "gsplat
     J = torch.clamp_min(eval_sh(sh_degree, sh_coeffs(params), d) + 0.5, 0.0)
     I = medium.compose(J, r, d) if medium is not None else J
     H, W = view.hw
-    out, alpha, meta = rasterize(means, params["quats"], torch.exp(params["scales"]), torch.sigmoid(params["opacities"]),
+    scales, opacities = torch.exp(params["scales"]), torch.sigmoid(params["opacities"])
+    scatter = getattr(medium, "scatter", None) if medium is not None else None
+    if scatter is not None:  # forward scattering: range-dependent blur, energy-preserving (gs/scatter.py)
+        scales, opacities = scatter.apply(means, params["quats"], scales, opacities, view.viewmat, view.K)
+    out, alpha, meta = rasterize(means, params["quats"], scales, opacities,
                                  torch.cat([I, J], -1)[None], view.viewmat[None], view.K[None], W, H,
                                  backend=backend, absgrad=absgrad)
     out, alpha = out[0], alpha[0]
