@@ -188,6 +188,25 @@ python scripts/heldout_appearance.py --out outputs --scenes Tokai,Cormoran,Isro,
        --variants mvs,mvs_lpips --per-view mvs_lpips      # -> eval/<variant>/heldout_appearance.json + table
 ```
 
+## SeaThru-NeRF (the data SeaSplat evaluates on): `scripts/prepare_seathru.py`
+
+Prepares the SeaThru-NeRF scenes the way 3DGS-based methods receive them (SeaSplat: undistorted images + `sparse/0`):
+the images of the dataset's own COLMAP model, from `images_wb/`; undistorted with COLMAP's undistorter (pycolmap,
+default options, JPEG quality 100) only if that model has lens distortion; scaled to 1600 px width if wider (3DGS
+default); every 8th image by name held out from index 0. `prepare.json` records the camera model, sizes and split.
+Our pipeline then runs with `sfm.distortion=False`: its SfM keeps the pinhole model and the images reach training and
+evaluation unchanged (bit-identical, checked on 20 real frames).
+
+```bash
+pip install pycolmap
+python scripts/prepare_seathru.py --src data/SeathruNeRF_dataset --out data/SeaThru
+python scripts/run_all.py --data data/SeaThru --out outputs_seathru --variants mvs_lpips \
+       --set train.scene_scale=0.8 --set sfm.distortion=False
+```
+
+SeaSplat's Table I (PSNR / SSIM / LPIPS): Curaçao 30.30 / 0.90 / 0.19, Japanese Gardens 22.70 / 0.87 / 0.18, Panama
+28.76 / 0.90 / 0.15, IUI3 26.67 / 0.87 / 0.21 (mean 27.11 / 0.885 / 0.182); 3DGS there 25.06 / 0.860 / 0.222.
+
 ## Outputs (`outputs/<scene>/`)
 
 ```

@@ -65,10 +65,15 @@ def max_distortion_px(cam: DistortedCamera, pin: PinholeCamera) -> float:
 def export_sfm(res: SfMResult, images: list, out_dir: str, scene: str, test_every: int = 8,
                min_distortion_px: float = 0.3) -> dict:
     cam = res.camera
-    pin = undistorted_camera(cam)
-    disp = max_distortion_px(cam, pin)
-    if disp < min_distortion_px:
-        pin = PinholeCamera(cam.width, cam.height, cam.fx, cam.fy, cam.cx, cam.cy)
+    if cam.k1 == 0.0 and cam.k2 == 0.0:
+        # pinhole model (sfm.distortion=False, images already undistorted): keep the images exactly as they are.
+        # undistorted_camera() would still zoom by half a pixel (it covers pixel centres), i.e. resample them.
+        pin, disp = PinholeCamera(cam.width, cam.height, cam.fx, cam.fy, cam.cx, cam.cy), 0.0
+    else:
+        pin = undistorted_camera(cam)
+        disp = max_distortion_px(cam, pin)
+        if disp < min_distortion_px:
+            pin = PinholeCamera(cam.width, cam.height, cam.fx, cam.fy, cam.cx, cam.cy)
     log(f"undistortion: max displacement {disp:.1f}px -> pinhole fx={pin.fx:.1f} fy={pin.fy:.1f}")
     mx, my = undistort_maps(cam, pin)
     files = []
