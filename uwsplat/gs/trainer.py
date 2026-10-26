@@ -11,10 +11,11 @@ import torch
 from ..common.io import load_json, log, save_json
 from .appearance import Appearance
 from .data import SceneData
-from .losses import (background_opacity, backscatter_prior, dense_depth_prior, edge_aware_smoothness, gray_world,
-                     reconstruction, saturation, sparse_depth_prior)
+from .losses import (PerceptualLoss, background_opacity, backscatter_prior, dense_depth_prior, edge_aware_smoothness,
+                     esl_smoothness, gray_world, reconstruction, saturation, sparse_depth_prior)
 from .medium import WaterMedium
-from .model import export_ply, init_params
+from .scatter import ForwardScatter
+from .model import DENSE, VERIFIED, export_ply, init_params
 from .render import render
 from .strategy import DensifyStrategy
 
@@ -22,14 +23,20 @@ from .strategy import DensifyStrategy
 @dataclass
 class TrainConfig:
     iterations: int = 30_000
-    init: str = "fused"              # fused (SIFT wreck + dense water) | sparse | dense
+    geometry: str = "fusion"         # fusion: v1 cloud + priors | mvs: v2 (MVS-verified dense cloud + priors)
+    init: str = "fused"              # fused (everything) | sparse | dense | verified (mvs: drop network-only points)
     sh_degree: int = 1
     sh_increase_every: int = 1000
     use_medium: bool = True
     binf_degree: int = 1
     appearance: bool = True
     init_opacity: float = 0.1
+    init_opacity_verified: float = 0.0  # > 0: initial opacity of MVS-verified points (0 = init_opacity)
+    surfel_ratio: float = 0.0        # > 0: points with a normal start as discs, thickness = ratio x size
     max_init_points: int = 0         # random subsample of the initial cloud (0 = keep all)
+    scene_scale: float = 0.0         # > 0: override the 3DGS extent (1.1 x camera radius) that scales the
+                                     # position lr and the densify / prune size thresholds; scenes are in
+                                     # median-range units, so 0.8 ~ the extent of Isro / Kwaj
     # learning rates: 3DGS defaults, means scaled by the scene extent
     lr_means: float = 1.6e-4
     lr_means_final: float = 1.6e-6
@@ -46,7 +53,18 @@ class TrainConfig:
     w_dense_depth: float = 0.05      # dense prior, water region
     w_sparse_depth: float = 0.05     # SIFT keypoint depths, wreck
     depth_decay: float = 0.1         # both decay log-linearly to this fraction at the end
-    w_smooth: float = 0.01
+    w_smooth: float = 0.01           # edge-aware smoothness of the rendered depth (uwsplat)
+    w_esl: float = 0.0               # RUSplatting edge-aware smoothness of the rendered image (their code: 0.05)
+    esl_beta: float = 5.0
+    esl_detach: bool = True          # False = exactly RUSplatting (depth edges are rewarded, see losses.py)
+    forward_scatter: bool = False    # range-dependent blur per Gaussian (gs/scatter.py), kappa learned
+    fs_kappa_init: float = 3e-4      # angular blur = kappa x range (radians, scene units)
+    fs_from: int = 0                 # step from which the blur is applied
+    w_lpips: float = 0.0             # > 0: LPIPS(render, photo) on training views (perceptual loss)
+    lpips_from: int = 15_000         # switched on late: densification has stopped (refine_stop) and geometry is set
+    lpips_ramp: int = 1000           # the weight rises linearly over this many steps (no jump for Adam)
+    lpips_net: str = "vgg"           # vgg = the evaluation network; alex = a perceptual loss that is not the metric
+    lpips_crop: int = 512            # one random crop x crop window per step (0 = whole image)
     w_gray_world: float = 0.01
     w_saturation: float = 0.1
     color_from: int = 3000
@@ -116,32 +134,49 @@ def train(out_dir: str, cfg: TrainConfig, tag: str = "full") -> dict:
     os.makedirs(gs_dir, exist_ok=True)
     save_json(os.path.join(gs_dir, "config.json"), asdict(cfg))
     dev = cfg.device
-    data = SceneData(out_dir, dev, cfg.downscale)
-    xyz, rgb, src = data.points(cfg.init)
+    data = SceneData(out_dir, dev, cfg.downscale, geometry=cfg.geometry)
+    xyz, rgb, src, nrm = data.points(cfg.init)
     if 0 < cfg.max_init_points < len(xyz):
         keep = np.random.default_rng(cfg.seed).choice(len(xyz), cfg.max_init_points, replace=False)
-        xyz, rgb, src = xyz[keep], rgb[keep], src[keep]
+        xyz, rgb, src, nrm = xyz[keep], rgb[keep], src[keep], nrm[keep]
+    scene_scale = cfg.scene_scale if cfg.scene_scale > 0 else data.scene_scale
     log(f"[{tag}] {len(data.train)} train / {len(data.test)} test views at {data.width}x{data.height}; "
-        f"init '{cfg.init}': {int((src == 0).sum())} SIFT + {int((src == 1).sum())} dense points; "
-        f"scene extent {data.scene_scale:.3f}")
+        f"init '{cfg.geometry}/{cfg.init}': {int((src == 0).sum())} SIFT + {int((src == DENSE).sum())} network-only"
+        f" + {int((src == VERIFIED).sum())} MVS-verified points; scene extent {data.scene_scale:.3f}"
+        f"{' -> %.3f (override)' % scene_scale if cfg.scene_scale > 0 else ''}")
 
     medium, bg = None, None
-    mi = load_json(os.path.join(out_dir, "fusion", "medium_init.json"))
+    mi_path = os.path.join(out_dir, cfg.geometry, "medium_init.json")
+    mi = load_json(mi_path if os.path.exists(mi_path) else os.path.join(out_dir, "fusion", "medium_init.json"))
     if cfg.use_medium:
         medium = WaterMedium(mi["binf"], mi["beta_d"], mi["beta_b"], cfg.binf_degree).to(dev)
         rgb = restored_colors(xyz, rgb, data, medium)
+        if cfg.forward_scatter:
+            medium.scatter = ForwardScatter(cfg.fs_kappa_init).to(dev)  # in the medium optimizer and checkpoint
         extra_opt = torch.optim.Adam(medium.parameters(), lr=cfg.lr_medium)
     else:
         bg = torch.nn.Parameter(torch.logit(torch.tensor(mi["binf"], dtype=torch.float32, device=dev).clamp(0.01, 0.99)))
         extra_opt = torch.optim.Adam([bg], lr=cfg.lr_medium)
-    params = init_params(xyz, rgb, np.full(len(xyz), cfg.init_opacity), cfg.sh_degree, dev)
-    optimizers = _optimizers(params, cfg, data.scene_scale)
+    opacity = np.full(len(xyz), cfg.init_opacity)
+    if cfg.init_opacity_verified > 0:
+        opacity[src == VERIFIED] = cfg.init_opacity_verified
+    params = init_params(xyz, rgb, opacity, cfg.sh_degree, dev, nrm, cfg.surfel_ratio)
+    optimizers = _optimizers(params, cfg, scene_scale)
     sched = torch.optim.lr_scheduler.ExponentialLR(
         optimizers["means"], gamma=(cfg.lr_means_final / cfg.lr_means) ** (1.0 / cfg.iterations))
     appearance = Appearance(len(data.train)).to(dev) if cfg.appearance else None
     app_opt = torch.optim.Adam(appearance.parameters(), lr=cfg.lr_appearance) if appearance is not None else None
     strategy = DensifyStrategy(**cfg.densify)
-    state = strategy.initialize_state(data.scene_scale, torch.tensor(src, device=dev))
+    state = strategy.initialize_state(scene_scale, torch.tensor(src, device=dev))
+    perceptual = None
+    if cfg.w_lpips > 0:
+        if cfg.lpips_from >= cfg.iterations:
+            log(f"[{tag}] WARNING: w_lpips > 0 but lpips_from ({cfg.lpips_from}) >= iterations ({cfg.iterations}): "
+                f"the perceptual loss never switches on")
+        perceptual = PerceptualLoss(cfg.lpips_net, cfg.lpips_crop, dev, cfg.seed)
+        log(f"[{tag}] LPIPS-{cfg.lpips_net} loss x {cfg.w_lpips} from step {cfg.lpips_from} "
+            f"(ramp {cfg.lpips_ramp}, crop {cfg.lpips_crop or 'full image'}); densification stops at "
+            f"{strategy.refine_stop}")
 
     log_f = open(os.path.join(gs_dir, "train_log.jsonl"), "w")
     order, t0, ema = [], time.time(), None
@@ -152,6 +187,8 @@ def train(out_dir: str, cfg: TrainConfig, tag: str = "full") -> dict:
         view = data.train[order.pop()]
         sh_deg = min(step // cfg.sh_increase_every, cfg.sh_degree)
         bg_rgb = torch.sigmoid(bg) if bg is not None else None
+        if medium is not None and hasattr(medium, "scatter"):
+            medium.scatter.active = step >= cfg.fs_from
         out = render(params, view, medium, sh_deg, cfg.backend, strategy.absgrad, appearance, bg_rgb)
         strategy.step_pre_backward(out["meta"])
         gt, depth, alpha = view.image, out["depth"], out["alpha"]
@@ -164,6 +201,11 @@ def train(out_dir: str, cfg: TrainConfig, tag: str = "full") -> dict:
             L["sparse"] = cfg.w_sparse_depth * decay * sparse_depth_prior(depth, alpha, view.kp_uv, view.kp_z)
         if cfg.w_smooth > 0:
             L["smooth"] = cfg.w_smooth * edge_aware_smoothness(depth, alpha, gt)
+        if cfg.w_esl > 0:
+            L["esl"] = cfg.w_esl * esl_smoothness(out["image"], depth, alpha, cfg.esl_beta, cfg.esl_detach)
+        if perceptual is not None and step >= cfg.lpips_from:
+            ramp = min(1.0, (step - cfg.lpips_from + 1) / max(cfg.lpips_ramp, 1))
+            L["lpips"] = cfg.w_lpips * ramp * perceptual(out["image"], gt)
         if medium is not None:
             if step >= cfg.color_from:
                 L["gray"] = cfg.w_gray_world * gray_world(out["restored"], alpha)
@@ -198,7 +240,10 @@ def train(out_dir: str, cfg: TrainConfig, tag: str = "full") -> dict:
             if medium is not None:
                 rec["beta_d"] = [round(x, 4) for x in medium.beta_d.tolist()]
                 rec["beta_b"] = [round(x, 4) for x in medium.beta_b.tolist()]
-            if cfg.eval_every and step > 0 and (step % cfg.eval_every == 0 or step == cfg.iterations - 1) and data.test:
+                if hasattr(medium, "scatter"):
+                    rec["fs_kappa"] = float(medium.scatter.kappa.detach())
+            # step 0 included: test PSNR of the initial cloud alone (v1 vs v2 initialisation)
+            if cfg.eval_every and (step % cfg.eval_every == 0 or step == cfg.iterations - 1) and data.test:
                 rec["test_psnr"] = quick_psnr(params, data.test, medium, sh_deg, cfg, bg_rgb)
             log_f.write(json.dumps(rec) + "\n")
             log_f.flush()
@@ -213,10 +258,15 @@ def train(out_dir: str, cfg: TrainConfig, tag: str = "full") -> dict:
             "medium": medium.state_dict() if medium is not None else None,
             "bg": bg.detach().cpu() if bg is not None else None,
             "appearance": appearance.state_dict() if appearance is not None else None,
-            "modality": state["modality"].cpu(), "scene_scale": data.scene_scale, "train_time_s": time.time() - t0}
+            "modality": state["modality"].cpu(), "scene_scale": scene_scale, "scene_scale_auto": data.scene_scale,
+            "train_time_s": time.time() - t0}
     torch.save(ckpt, os.path.join(gs_dir, "ckpt.pt"))
     export_ply(params, os.path.join(gs_dir, "point_cloud.ply"))
-    final = {"n_gaussians": len(params["means"]), "n_from_dense": int((state["modality"] == 1).sum()),
+    final = {"n_gaussians": len(params["means"]), "n_from_dense": int((state["modality"] == DENSE).sum()),
+             "n_from_verified": int((state["modality"] == VERIFIED).sum()),
+             "n_init": {"sift": int((src == 0).sum()), "network": int((src == DENSE).sum()),
+                        "verified": int((src == VERIFIED).sum())},
+             "scene_scale": scene_scale, "scene_scale_auto": data.scene_scale,
              "train_time_s": round(time.time() - t0, 1), "medium": medium.summary() if medium is not None else None}
     save_json(os.path.join(gs_dir, "final.json"), final)
     log(f"[{tag}] done in {final['train_time_s']}s, {final['n_gaussians']} Gaussians")

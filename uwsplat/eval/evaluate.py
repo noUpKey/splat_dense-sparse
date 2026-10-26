@@ -35,6 +35,9 @@ def load_model(ckpt_path: str, device: str):
     if ckpt["medium"] is not None:
         binf_deg = int(round(np.sqrt(ckpt["medium"]["binf_sh"].shape[0]))) - 1
         medium = WaterMedium(np.full(3, 0.5), np.full(3, 0.5), np.full(3, 0.5), binf_deg).to(device)
+        if any(k.startswith("scatter.") for k in ckpt["medium"]):
+            from ..gs.scatter import ForwardScatter
+            medium.scatter = ForwardScatter().to(device)
         medium.load_state_dict(ckpt["medium"])
     if ckpt["bg"] is not None:
         bg = torch.sigmoid(ckpt["bg"].to(device))

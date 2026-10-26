@@ -35,9 +35,17 @@ class FusionConfig:
     outlier_std: float = 2.5
 
 
-def _bilinear_rgb(img: np.ndarray, uv: np.ndarray) -> np.ndarray:
-    m = (uv - 0.5).astype(np.float32)
-    return cv2.remap(img, m[:, None, 0], m[:, None, 1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)[:, 0]
+def _bilinear_rgb(img: np.ndarray, uv: np.ndarray, width: int = 4096) -> np.ndarray:
+    """Bilinear colours at full-resolution pixel positions uv (+0.5 convention), (n, 2) -> (n, 3).
+    The lookup maps are folded into rows of `width`: cv2.remap rejects maps with >= 32767 rows."""
+    n = len(uv)
+    if n == 0:
+        return np.zeros((0, img.shape[2]), img.dtype)
+    m = np.zeros((n + (-n) % width, 2), np.float32)
+    m[:n] = uv - 0.5
+    out = cv2.remap(img, m[:, 0].reshape(-1, width), m[:, 1].reshape(-1, width), cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REFLECT)
+    return out.reshape(-1, img.shape[2])[:n]
 
 
 def _voxel_merge(xyz, rgb, conf, view, voxel):

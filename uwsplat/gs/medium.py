@@ -62,5 +62,6 @@ class WaterMedium(nn.Module):
         return (I - bs) * torch.exp(self.beta_d * r)
 
     def summary(self) -> dict:
-        return {"beta_d": self.beta_d.tolist(), "beta_b": self.beta_b.tolist(),
+        extra = self.scatter.summary() if hasattr(self, "scatter") else {}
+        return {**extra, "beta_d": self.beta_d.tolist(), "beta_b": self.beta_b.tolist(),
                 "binf_sh": self.binf_sh.detach().cpu().tolist(), "binf_dc": torch.sigmoid(C0 * self.binf_sh[0]).tolist()}
