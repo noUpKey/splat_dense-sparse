@@ -60,4 +60,4 @@ class ForwardScatter(nn.Module):
         return torch.sqrt(scales ** 2 + b2[:, None]), opacities * ratio
 
     def summary(self) -> dict:
-        return {"kappa": float(self.kappa)}
+        return {"kappa": float(self.kappa.detach())}

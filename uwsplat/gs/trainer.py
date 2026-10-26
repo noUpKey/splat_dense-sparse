@@ -241,7 +241,7 @@ def train(out_dir: str, cfg: TrainConfig, tag: str = "full") -> dict:
                 rec["beta_d"] = [round(x, 4) for x in medium.beta_d.tolist()]
                 rec["beta_b"] = [round(x, 4) for x in medium.beta_b.tolist()]
                 if hasattr(medium, "scatter"):
-                    rec["fs_kappa"] = float(medium.scatter.kappa)
+                    rec["fs_kappa"] = float(medium.scatter.kappa.detach())
             # step 0 included: test PSNR of the initial cloud alone (v1 vs v2 initialisation)
             if cfg.eval_every and (step % cfg.eval_every == 0 or step == cfg.iterations - 1) and data.test:
                 rec["test_psnr"] = quick_psnr(params, data.test, medium, sh_deg, cfg, bg_rgb)
