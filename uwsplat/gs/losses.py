@@ -156,3 +156,15 @@ def background_opacity(alpha, gt, binf_map, thresh=0.08):
     """Pixels the medium alone explains (|gt - B_inf(d)| small) should be left transparent."""
     m = ((gt - binf_map.detach()).norm(dim=-1, keepdim=True) < thresh).float()
     return (alpha * m).sum() / m.sum().clamp_min(1.0)
+
+
+def needle_penalty(log_scales, max_ratio=10.0):
+    """Selective shape regulariser: only Gaussians whose longest axis exceeds `max_ratio` x their middle axis
+    (needles / streaks) are penalised, by the log of the excess; every other Gaussian gets zero gradient.
+
+    Needles are how a sparse-view fit explains thin view-specific detail (caustics, particles, compression
+    noise): seen from a training camera along their short axes they are one pixel wide, from a new pose they
+    become streaks. Using the middle axis (not the smallest) leaves flat discs alone, which are the correct
+    shape for surfaces (and what the surfel initialisation creates)."""
+    s = torch.sort(log_scales, dim=-1).values          # log scales: ratio = difference
+    return F.relu(s[:, 2] - s[:, 1] - torch.log(torch.tensor(max_ratio, device=s.device))).mean()

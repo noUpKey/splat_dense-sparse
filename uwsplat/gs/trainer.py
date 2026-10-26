@@ -12,10 +12,11 @@ from ..common.io import load_json, log, save_json
 from .appearance import Appearance
 from .data import SceneData
 from .losses import (PerceptualLoss, background_opacity, backscatter_prior, dense_depth_prior, edge_aware_smoothness,
-                     esl_smoothness, gray_world, reconstruction, saturation, sparse_depth_prior)
+                     esl_smoothness, gray_world, needle_penalty, reconstruction, saturation, sparse_depth_prior)
 from .medium import WaterMedium
 from .scatter import ForwardScatter
 from .model import DENSE, VERIFIED, export_ply, init_params
+from .pseudo import PseudoViews, pseudo_depth_loss
 from .render import render
 from .strategy import DensifyStrategy
 
@@ -65,6 +66,14 @@ class TrainConfig:
     lpips_ramp: int = 1000           # the weight rises linearly over this many steps (no jump for Adam)
     lpips_net: str = "vgg"           # vgg = the evaluation network; alex = a perceptual loss that is not the metric
     lpips_crop: int = 512            # one random crop x crop window per step (0 = whole image)
+    # selective regularisers against the train / test gap (sparse-view overfitting)
+    w_pv: float = 0.0                # > 0: pseudo-view depth consistency with the MVS-verified cloud (gs/pseudo.py)
+    pv_from: int = 1000              # after the first densification steps have placed the Gaussians
+    pv_every: int = 2                # one pseudo view every this many steps
+    pv_scale: float = 0.25           # resolution of the pseudo render (depth only; 1280x720 -> 320x180)
+    pv_extrap: float = 0.25          # pseudo poses t ~ U(-extrap, 1 + extrap) between consecutive training cameras
+    w_needle: float = 0.0            # > 0: penalise needles (longest / middle axis > needle_ratio) only
+    needle_ratio: float = 10.0
     w_gray_world: float = 0.01
     w_saturation: float = 0.1
     color_from: int = 3000
@@ -168,6 +177,16 @@ def train(out_dir: str, cfg: TrainConfig, tag: str = "full") -> dict:
     app_opt = torch.optim.Adam(appearance.parameters(), lr=cfg.lr_appearance) if appearance is not None else None
     strategy = DensifyStrategy(**cfg.densify)
     state = strategy.initialize_state(scene_scale, torch.tensor(src, device=dev))
+    pseudo = None
+    if cfg.w_pv > 0:
+        if cfg.geometry != "mvs" or not (src == VERIFIED).any():
+            raise ValueError("w_pv > 0 needs geometry='mvs' with MVS-verified points (the targets)")
+        pseudo = PseudoViews(data.train, xyz[src == VERIFIED], cfg.pv_scale, cfg.pv_extrap, cfg.seed)
+        log(f"[{tag}] pseudo-view depth regulariser x {cfg.w_pv} from step {cfg.pv_from} every {cfg.pv_every}: "
+            f"{len(pseudo)} camera pairs, {len(pseudo.X)} verified points, {pseudo.W}x{pseudo.H}, "
+            f"t in [{-cfg.pv_extrap}, {1 + cfg.pv_extrap}]")
+    if cfg.w_needle > 0:
+        log(f"[{tag}] needle regulariser x {cfg.w_needle} on Gaussians with longest / middle axis > {cfg.needle_ratio}")
     perceptual = None
     if cfg.w_lpips > 0:
         if cfg.lpips_from >= cfg.iterations:
@@ -179,7 +198,7 @@ def train(out_dir: str, cfg: TrainConfig, tag: str = "full") -> dict:
             f"{strategy.refine_stop}")
 
     log_f = open(os.path.join(gs_dir, "train_log.jsonl"), "w")
-    order, t0, ema = [], time.time(), None
+    order, t0, ema, loss_ema, pv_cov = [], time.time(), None, None, None
     for step in range(cfg.iterations):
         if not order:
             order = list(range(len(data.train)))
@@ -216,6 +235,13 @@ def train(out_dir: str, cfg: TrainConfig, tag: str = "full") -> dict:
                 L["bg_opacity"] = cfg.w_bg_opacity * background_opacity(alpha, gt, out["background"], cfg.bg_thresh)
         if appearance is not None:
             L["appearance"] = cfg.w_appearance * appearance.regularizer()
+        if cfg.w_needle > 0:
+            L["needle"] = cfg.w_needle * needle_penalty(params["scales"], cfg.needle_ratio)
+        if pseudo is not None and step >= cfg.pv_from and step % cfg.pv_every == 0:
+            pview, target = pseudo.sample()
+            pout = render(params, pview, medium, sh_deg, cfg.backend, False, None, bg_rgb)
+            pv, pv_cov = pseudo_depth_loss(pout["depth"], pout["alpha"], target)
+            L["pv"] = cfg.w_pv * pv
         loss = sum(L.values())
         loss.backward()
 
@@ -234,9 +260,14 @@ def train(out_dir: str, cfg: TrainConfig, tag: str = "full") -> dict:
         with torch.no_grad():  # running train PSNR kept on the device: no per-step GPU sync
             psnr = -10 * torch.log10(((out["image"].detach().clamp(0, 1) - gt) ** 2).mean())
             ema = psnr if ema is None else 0.95 * ema + 0.05 * psnr
+            lo = loss.detach()
+            loss_ema = lo if loss_ema is None else 0.98 * loss_ema + 0.02 * lo
         if step % cfg.log_every == 0 or step == cfg.iterations - 1:
-            rec = {"step": step, "loss": loss.item(), "train_psnr_ema": ema.item(), "n_gaussians": len(params["means"]),
+            rec = {"step": step, "view": view.name, "loss": loss.item(), "loss_ema": loss_ema.item(),
+                   "train_psnr_ema": ema.item(), "n_gaussians": len(params["means"]),
                    **{k: v.item() for k, v in L.items()}, **dstats}
+            if "pv" in L:
+                rec["pv_coverage"] = pv_cov.item()
             if medium is not None:
                 rec["beta_d"] = [round(x, 4) for x in medium.beta_d.tolist()]
                 rec["beta_b"] = [round(x, 4) for x in medium.beta_b.tolist()]
@@ -249,7 +280,8 @@ def train(out_dir: str, cfg: TrainConfig, tag: str = "full") -> dict:
             log_f.flush()
             if step % (cfg.log_every * 10) == 0 or "test_psnr" in rec:
                 it_s = (step + 1) / (time.time() - t0)
-                log(f"[{tag}] step {step:6d} loss {rec['loss']:.4f} train PSNR {rec['train_psnr_ema']:.2f} "
+                log(f"[{tag}] step {step:6d} loss {rec['loss']:.4f} (avg {rec['loss_ema']:.4f}) "
+                    f"train PSNR {rec['train_psnr_ema']:.2f} "
                     f"{'test PSNR %.2f ' % rec['test_psnr'] if 'test_psnr' in rec else ''}"
                     f"#GS {len(params['means'])} ({it_s:.1f} it/s)")
     log_f.close()

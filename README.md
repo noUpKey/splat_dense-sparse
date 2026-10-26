@@ -285,3 +285,18 @@ Reference averages on Submerged3D (reported by the papers, not re-run): RUSplatt
 - Hyper-parameters are 3DGS/SeaSplat defaults plus a few chosen from the measurements above; they have not been tuned on the test views.
 #   s p l a t _ d e n s e - s p a r s e  
  
+## Selective regularisers (train / test gap)
+
+`mvs_lpips` reaches ~35.6 dB on its training views and ~22.6 dB on held-out views (Tokai): it overfits the
+training cameras. Two regularisers act only where that happens (`python -m tests.test_pseudo`):
+
+- `pv` (`w_pv=0.05`, `gs/pseudo.py`): every `pv_every` steps a camera is interpolated between two consecutive
+  training cameras (`t ~ U(-pv_extrap, 1 + pv_extrap)`), its depth is rendered at `pv_scale` resolution and compared
+  (|log ratio|) with the z-buffered MVS-verified points seen from there. Only verified, front-most points, not hidden
+  behind a nearer surface, on pixels the render covers; no photo is compared, so only geometry is constrained.
+  Needs `geometry="mvs"`.
+- `needle` (`w_needle=0.1`): only Gaussians whose longest axis exceeds `needle_ratio` (10) x their middle axis are
+  penalised; spheres and discs get no gradient.
+
+`python scripts/run_all.py ... --variants mvs_lpips+pv,mvs_lpips+needle`. The training log now prints a running
+average of the loss next to the single-step value, and `train_log.jsonl` records the view of each logged step.

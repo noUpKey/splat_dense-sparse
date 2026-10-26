@@ -51,6 +51,9 @@ VARIANTS = {
     "sh3": {"sh_degree": 3},
     "fs": {"forward_scatter": True},                               # forward scattering (gs/scatter.py)
     "fs3k": {"forward_scatter": True, "fs_from": 3000},            # ... switched on after the warm-up
+    # selective regularisers against the train / test gap (training PSNR ~35 dB vs held-out ~22 dB)
+    "pv": {"w_pv": 0.05},                                          # pseudo-view depth vs MVS-verified cloud
+    "needle": {"w_needle": 0.1},                                   # only Gaussians longer than 10x their middle axis
 }
 
 
