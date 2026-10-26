@@ -53,6 +53,7 @@ SIFT, COMPLETED, VERIFIED = 0, 1, 2
 class MVSConfig:
     scale: float = 0.5              # MVS grid = scale x undistorted frame (1280x720 -> 640x360)
     n_src: int = 4                  # source views per reference view
+    use_aux: bool = True            # interpolated 'aux' frames (if any) may serve as source views
     min_angle: float = 2.0          # deg; median triangulation angle of shared SIFT points
     good_angle: float = 6.0
     max_angle: float = 35.0
@@ -110,13 +111,15 @@ def resample(m: np.ndarray, src: NetGrid, dst: NetGrid) -> np.ndarray:
     return out
 
 
-def select_sources(pts, C, views, o_ok, cfg: MVSConfig) -> dict:
-    """For each view: the n_src views sharing the most SIFT points at a useful triangulation angle."""
-    vis = {v: np.unique(pts["obs_pt"][o_ok & (pts["obs_img"] == v)]) for v in views}
+def select_sources(pts, C, views, o_ok, cfg: MVSConfig, candidates=None) -> dict:
+    """For each view: the n_src views (from `candidates`, default the views themselves) sharing the most SIFT
+    points at a useful triangulation angle."""
+    candidates = list(views) if candidates is None else list(candidates)
+    vis = {v: np.unique(pts["obs_pt"][o_ok & (pts["obs_img"] == v)]) for v in dict.fromkeys(list(views) + candidates)}
     out = {}
     for i in views:
         cand = []
-        for j in views:
+        for j in candidates:
             if j == i:
                 continue
             shared = np.intersect1d(vis[i], vis[j], assume_unique=True)
@@ -268,9 +271,15 @@ def run_mvs(out_dir: str, cfg: MVSConfig = MVSConfig()) -> dict:
     f_grid = float(max(Km[0, 0], Km[1, 1]))
     dev = cfg.device if (torch.cuda.is_available() and cfg.device.startswith("cuda")) else "cpu"
     views = [int(v) for v in np.where(train)[0]]
+    # interpolated frames between consecutive training frames (scripts/make_interframes.py): extra source views
+    # for the photometric check only; points still need two real training observations (train_ok)
+    aux = [i for i, im in enumerate(meta["images"]) if im["registered"] and im["split"] == "aux"] if cfg.use_aux else []
     C = camera_center(R, t)
     o_ok = pts["train_ok"][pts["obs_pt"]] & train[pts["obs_img"]]
-    srcs = select_sources(pts, C, views, o_ok, cfg)
+    is_src = train.copy()
+    is_src[aux] = True
+    o_src = pts["train_ok"][pts["obs_pt"]] & is_src[pts["obs_img"]]
+    srcs = select_sources(pts, C, views, o_src, cfg, views + aux)
     stems = {i: os.path.splitext(im["name"])[0] for i, im in enumerate(meta["images"])}
 
     dense_dir = os.path.join(out_dir, "dense")
@@ -278,16 +287,17 @@ def run_mvs(out_dir: str, cfg: MVSConfig = MVSConfig()) -> dict:
     ng = NetGrid(**load_json(os.path.join(dense_dir, "summary.json"))["grid"]) if have_prior else None
     fus_stats = os.path.join(out_dir, "fusion", "stats.json")
     fcfg = FusionConfig(**load_json(fus_stats)["config"]) if os.path.exists(fus_stats) else FusionConfig()
-    log(f"mvs: {len(views)} training views on a {g.w}x{g.h} grid, {cfg.n_src} sources each, "
+    log(f"mvs: {len(views)} training views{f' + {len(aux)} interpolated source frames' if aux else ''} "
+        f"on a {g.w}x{g.h} grid, {cfg.n_src} sources each, "
         f"{'network prior + wide pass' if have_prior else 'wide pass only (no dense stage)'}")
     for d in ("priors", "viz", "masks"):
         os.makedirs(os.path.join(out_dir, "mvs", d), exist_ok=True)
 
     imgs, grays, prior = {}, {}, {}
-    for i in views:
+    for i in views + aux:
         imgs[i] = load_rgb(os.path.join(out_dir, meta["images"][i]["file"]))
         grays[i] = cv2.cvtColor(to_grid(imgs[i], g), cv2.COLOR_RGB2GRAY).astype(np.float32)
-        if have_prior:
+        if have_prior and i in views:
             prior[i] = resample(np.load(os.path.join(dense_dir, stems[i] + ".npz"))["depth"].astype(np.float32), ng, g)
 
     depth, score, textured, n_hyp_used = {}, {}, {}, {}
@@ -483,7 +493,7 @@ def run_mvs(out_dir: str, cfg: MVSConfig = MVSConfig()) -> dict:
     agg = lambda key: float(np.mean([v[key] for v in per_view.values() if v[key] is not None])) if per_view else None
     cat = lambda a: np.concatenate(a) if a else np.zeros(0)
     summary = {
-        "config": asdict(cfg), "grid": asdict(g), "K": Km.tolist(), "views": views, "have_prior": have_prior,
+        "config": asdict(cfg), "grid": asdict(g), "K": Km.tolist(), "views": views, "aux_views": aux, "have_prior": have_prior,
         "points": {"sift": int(len(sp_xyz)), "completed": int(len(cx)), "verified": int(len(vx)),
                    "verified_with_normal": int((np.linalg.norm(vn, axis=1) > 0.5).sum()) if len(vn) else 0,
                    "voxel_verified": v_vox, "voxel_completed": c_vox},

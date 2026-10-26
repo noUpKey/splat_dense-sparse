@@ -188,6 +188,16 @@ python scripts/heldout_appearance.py --out outputs --scenes Tokai,Cormoran,Isro,
        --variants mvs,mvs_lpips --per-view mvs_lpips      # -> eval/<variant>/heldout_appearance.json + table
 ```
 
+## Interpolated frames as extra geometry views (`scripts/make_interframes.py`)
+
+`python scripts/make_interframes.py --src Submerged3D --out Submerged3D_ifi --method raft` copies the real frames and
+adds one optical-flow midpoint frame (`<stem>__ifi.png`) between every two consecutive frames that are both training
+frames (never next to a test frame). In the pipeline these frames get the split `aux`: the SfM registers them (more
+tracks), the MVS stage may pick them as source views, nothing trains on or scores them, and a point still needs two
+real training observations. Run the whole pipeline on `Submerged3D_ifi` into a separate output folder.
+CPU check on Isro (wide pass only): 34/34 registered, SIFT points 14.3k vs 13.8k, verified points 646k vs 592k,
+verified pixels 43 % vs 44 %, depth vs SIFT 0.47 % vs 0.44 % median: the MVS rarely picks the narrow-baseline frames.
+
 ## Forward scattering (`fs` component, `uwsplat/gs/scatter.py`)
 
 Small-angle scattering blurs a surface's image by an angle that grows with the path length r. Each Gaussian keeps its

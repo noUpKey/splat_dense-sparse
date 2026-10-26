@@ -18,10 +18,15 @@ from .bundle import reprojection_errors
 from .reconstruct import SfMResult
 
 
+AUX_TAG = "__ifi"  # frames made by scripts/make_interframes.py: geometry helpers, never trained on or scored
+
+
 def test_split(names: list, every: int = 8) -> list:
-    """Standard LLFF/3DGS hold-out: every `every`-th image (sorted by name) is a test view."""
-    order = {n: k for k, n in enumerate(sorted(names))}
-    return ["test" if order[n] % every == 0 else "train" for n in names]
+    """Standard LLFF/3DGS hold-out: every `every`-th image (sorted by name) is a test view. Interpolated frames
+    (AUX_TAG in the name) are 'aux' and do not shift the split of the real frames."""
+    real = sorted(n for n in names if AUX_TAG not in n)
+    order = {n: k for k, n in enumerate(real)}
+    return ["aux" if AUX_TAG in n else ("test" if order[n] % every == 0 else "train") for n in names]
 
 
 def normalize(res: SfMResult):

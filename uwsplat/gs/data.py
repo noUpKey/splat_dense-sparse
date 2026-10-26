@@ -109,8 +109,10 @@ class SceneData:
                     view.kp_uv = torch.from_numpy(pr["kp_uv"] * s).float().to(device)
                     view.kp_z = torch.from_numpy(pr["kp_z"]).float().to(device)
                 self.train.append(view)
-            else:
+            elif im["split"] == "test":
                 self.test.append(view)
+            else:
+                continue  # 'aux' (interpolated frames): geometry only
             self.views.append(view)
         C = torch.stack([v.campos for v in self.train])
         # 3DGS convention: extent = 1.1 x radius of the training camera centres
