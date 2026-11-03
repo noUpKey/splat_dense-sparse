@@ -60,6 +60,8 @@ def main():
     S = A @ A.transpose(1, 2) + 0.1 * torch.eye(3)
     q, s = cov_to_quat_scale(S)
     assert torch.allclose(gaussian_cov(q, s), S, atol=1e-4, rtol=1e-4)
+    q7, s7 = cov_to_quat_scale(S, chunk=7)                         # chunked CPU path = one batch
+    assert torch.allclose(gaussian_cov(q7, s7), S, atol=1e-4, rtol=1e-4)
 
     # 2. the 2D factor conserves the integral alpha * 2 pi sqrt(det(J S J^T + eps))
     J = torch.randn(50, 2, 3) * 10

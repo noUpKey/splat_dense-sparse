@@ -66,6 +66,13 @@ def _det2(c):
     return (c[:, 0, 0] * c[:, 1, 1] - c[:, 0, 1] * c[:, 1, 0]).clamp_min(1e-20)
 
 
+def _det3(c):
+    """Closed-form 3x3 determinant (batched linalg on millions of tiny matrices can need huge GPU workspaces)."""
+    return (c[:, 0, 0] * (c[:, 1, 1] * c[:, 2, 2] - c[:, 1, 2] * c[:, 2, 1])
+            - c[:, 0, 1] * (c[:, 1, 0] * c[:, 2, 2] - c[:, 1, 2] * c[:, 2, 0])
+            + c[:, 0, 2] * (c[:, 1, 0] * c[:, 2, 1] - c[:, 1, 1] * c[:, 2, 0]))
+
+
 def factor_2d(J, S, S2, eps=EPS2D):
     """sqrt(det(J S J^T + eps I) / det(J S2 J^T + eps I)) per Gaussian: conserves the projected splat's integral."""
     I2 = eps * torch.eye(2, dtype=S.dtype, device=S.device)
@@ -75,7 +82,7 @@ def factor_2d(J, S, S2, eps=EPS2D):
 
 
 def factor_3d(S, S2):
-    return torch.sqrt(torch.linalg.det(S.double()).clamp_min(1e-30) / torch.linalg.det(S2.double()).clamp_min(1e-30)
+    return torch.sqrt(_det3(S.double()).clamp_min(1e-30) / _det3(S2.double()).clamp_min(1e-30)
                       ).clamp(max=1.0).to(S.dtype)
 
 
@@ -100,10 +107,15 @@ def rotmat_to_quat(R):
     return out / out.norm(dim=1, keepdim=True)
 
 
-def cov_to_quat_scale(S):
-    """Symmetric positive definite (N, 3, 3) -> (quats, scales) with R diag(s^2) R^T = S (the rasteriser's inputs)."""
-    evals, evecs = torch.linalg.eigh(S.double())
-    flip = torch.linalg.det(evecs) < 0
+def cov_to_quat_scale(S, chunk=1 << 18):
+    """Symmetric positive definite (N, 3, 3) -> (quats, scales) with R diag(s^2) R^T = S (the rasteriser's inputs).
+    The eigen-decomposition runs on the CPU in chunks: CUDA's batched eigh asks for ~0.5 MB of workspace per 3x3
+    matrix (966 GB for 1.9 M Gaussians on a T4); on the CPU 1.9 M take ~5 s."""
+    Sc = S.detach().double().cpu()
+    evals, evecs = map(torch.cat, zip(*(torch.linalg.eigh(Sc[i:i + chunk]) for i in range(0, len(Sc), chunk)))) \
+        if len(Sc) else (Sc.new_zeros(0, 3), Sc.new_zeros(0, 3, 3))
+    evals, evecs = evals.to(S.device), evecs.to(S.device)
+    flip = _det3(evecs) < 0
     evecs[flip, :, 0] = -evecs[flip, :, 0]
     return rotmat_to_quat(evecs).to(S.dtype), torch.sqrt(evals.clamp_min(1e-20)).to(S.dtype)
 
