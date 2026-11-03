@@ -1,6 +1,6 @@
 """Geometric-uncertainty splatting (C2) on a trained uwsplat model: no training, re-render and score.
 
-python scripts/uncertainty_splat.py --scene_out outputs/Tokai --tag mvs_lpips [--variants base,c2,fade,c2_det3,mip]
+python scripts/uncertainty_splat.py --scene_out outputs/Tokai --tag mvs_lpips [--variants base,c2,fade,c2_det3,mip,cull]
 
 Writes <scene_out>/eval/<tag>/uncertainty_splat.json (per test view: PSNR / SSIM / LPIPS, PSNR on seen and
 never-seen pixels, sequence position; per training view: PSNR with its own colour correction) and, with

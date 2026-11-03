@@ -17,6 +17,8 @@ Render-time variants for any camera c (J = that camera's Jacobian, eps = the ras
     c2_det3  Sigma' as c2;                alpha' = alpha sqrt(det Sigma / det Sigma')   (3D factor, as Mip / Robust GS)
     mip      Sigma' = Sigma + sigma_px^2 (min_k z_ik / f_k)^2 I over the views that see it, 3D factor: Mip-Splatting's
              3D filter applied after training (the best-view isotropic special case of P_i)
+    cull     the trained model without the Gaussians that no training view sees (control: c2 and fade drop those
+             too, because their prior-only P makes the opacity factor tiny; c2 must beat this to be more than culling)
 
 Properties (proven; checked by tests/test_uncertainty.py): the 2D factor conserves each splat's integrated
 contribution in every view; in every training view with w_ik = 1, J P J^T <= sigma_px^2 I, so training views change
@@ -38,7 +40,7 @@ from .heldout import apply_affine, centred_appearance, seen_mask
 from .metrics import lpips, psnr, quantize, ssim
 
 EPS2D = 0.3
-VARIANTS = ("base", "c2", "fade", "c2_det3", "mip")
+VARIANTS = ("base", "c2", "fade", "c2_det3", "mip", "cull")
 
 
 # ----------------------------------------------------------------------------------------------- geometry helpers
@@ -192,7 +194,7 @@ def position_uncertainty(params, medium, train_views, backend, sigma2=0.2, w0=1.
 # ------------------------------------------------------------------------------------------------------ rendering
 @torch.no_grad()
 def render_variant(params, view, medium, sh_degree, backend, bg_color, mode="base", P=None, mipvar=None, kappa=1.0,
-                   cache=None):
+                   cache=None, nviews=None):
     """gs/render.py's render (colour, medium, open-water background) with the covariance / opacity of `mode`.
     `cache` (a dict, optional) keeps each mode's widened covariance and its (quats, scales) across views: they do not
     depend on the camera unless the model has forward scatter (view-dependent scales), in which case it is ignored."""
@@ -204,7 +206,9 @@ def render_variant(params, view, medium, sh_degree, backend, bg_color, mode="bas
     I = medium.compose(J, r, d) if medium is not None else J
     scales, opacities = base_scales_opacities(params, medium, view)
     quats = params["quats"]
-    if mode != "base":
+    if mode == "cull":
+        opacities = torch.where(nviews > 0, opacities, torch.zeros_like(opacities))
+    elif mode != "base":
         if cache is not None and getattr(medium, "scatter", None) is not None:
             cache = None
         key = "mip" if mode == "mip" else "P"
@@ -260,7 +264,7 @@ def run(out_dir, tag, device="cuda", backend=None, variants=VARIANTS, sigma2=0.2
     train_idx = [v.idx for v in train]
     P, mipvar, nviews, stats = position_uncertainty(params, medium, train, backend, sigma2, w0, tau, sigma_z)
     log(f"[uncertainty] {data.meta['scene']}: {stats}")
-    kw = dict(P=P, mipvar=mipvar, kappa=kappa, cache={})   # widened covariances decomposed once per variant
+    kw = dict(P=P, mipvar=mipvar, kappa=kappa, cache={}, nviews=nviews)   # widened covariances decomposed once per variant
     sh = cfg["sh_degree"]
 
     test = {}
