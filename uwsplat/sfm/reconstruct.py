@@ -41,6 +41,9 @@ class SfMConfig:
     final_max_err_px: float = 3.0
     loss_scale_px: float = 2.0
     refine_intrinsics_from: int = 4
+    distortion: bool = True           # False: pinhole (k1 = k2 = 0), for images that are already undistorted, so
+                                      # they reach training and evaluation unchanged (e.g. SeaThru-NeRF prepared
+                                      # with scripts/prepare_seathru.py)
     ba_iters: int = 15
     final_ba_iters: int = 60
     device: str = "cpu"
@@ -109,6 +112,7 @@ class IncrementalSfM:
         log(f"self-calibration: fx={fx:.1f} fy={fy:.1f} (fy/fx={fy / fx:.3f})")
         self.f_init = (fx, fy)
         self.cam = DistortedCamera(W, H, fx, fy, W / 2.0, H / 2.0)
+        self.intrinsics = ("fx", "fy", "k1", "k2") if cfg.distortion else ("fx", "fy")
         self.X = np.full((T.n, 3), np.nan)
         self.obs_ok = np.zeros(len(T.obs_img), bool)
         self.reg = np.zeros(self.n_img, bool)
@@ -266,7 +270,7 @@ class IncrementalSfM:
         cfg = self.cfg
         self._triangulate_missing()
         self._refresh(cfg.tri_max_err_px)
-        refine = ("fx", "fy", "k1", "k2") if self.reg.sum() >= cfg.refine_intrinsics_from else ()
+        refine = self.intrinsics if self.reg.sum() >= cfg.refine_intrinsics_from else ()
         info = self._bundle(iters or cfg.ba_iters, refine)
         self._refresh(cfg.tri_max_err_px)
         return info
@@ -301,11 +305,11 @@ class IncrementalSfM:
         # final polishing
         self._triangulate_missing()
         self._refresh(cfg.tri_max_err_px)
-        self._bundle(cfg.final_ba_iters, ("fx", "fy", "k1", "k2"))
+        self._bundle(cfg.final_ba_iters, self.intrinsics)
         self._refresh(cfg.final_max_err_px)
         self._triangulate_missing()
         self._refresh(cfg.final_max_err_px)
-        info = self._bundle(cfg.final_ba_iters, ("fx", "fy", "k1", "k2"))
+        info = self._bundle(cfg.final_ba_iters, self.intrinsics)
         self._refresh(cfg.final_max_err_px)
         return self._result(info, time.time() - t0)
 

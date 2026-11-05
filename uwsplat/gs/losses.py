@@ -4,6 +4,10 @@ Images are (H, W, 3) tensors, depth/alpha (H, W, 1).
   reconstruction : (1 - l) L1 + l (1 - SSIM) on the composited underwater image
   depth          : edge-aware smoothness of rendered depth (fixes SeaSplat's signed image
                    gradient), dense prior on the water region, SIFT keypoint depths on the wreck
+  RUSplatting    : edge-aware smoothness of the rendered *image*, switched off across rendered
+                   depth edges (RUSplatting's EdgeSmoothnessLoss, "ESL")
+  perceptual     : LPIPS between the rendered training image and the photo (frozen VGG / AlexNet),
+                   switched on late in training by the trainer
   colour         : grey-world and saturation priors on the restored radiance J
   medium         : dark-pixel backscatter prior, background opacity prior
 """
@@ -51,6 +55,62 @@ def edge_aware_smoothness(depth, alpha, img, gamma=10.0):
     return (gx * wx).mean() + (gy * wy).mean()
 
 
+def esl_smoothness(image, depth, alpha, beta=5.0, detach=True):
+    """RUSplatting's edge-aware smoothness loss (utils/loss_utils.py EdgeSmoothnessLoss, called with
+    beta=5 and weight 0.05 in train.py; the paper writes lambda_s = 0.2):
+
+        mean |d_x I| exp(-beta |d_x D|) + mean |d_y I| exp(-beta |d_y D|)
+
+    I is the rendered underwater image, D the rendered depth. Their rasteriser outputs accumulated
+    depth (sum z alpha T, 0 where nothing is drawn), so coverage boundaries count as depth edges; here
+    D = expected depth x alpha, divided by the mean depth of the covered pixels, which makes beta
+    independent of the scene scale (uwsplat scenes have median range 1, so the division is ~1).
+
+    detach=True (default) keeps the weights out of the gradient: in the original, lowering the loss by
+    *creating* depth jumps at texture edges is also rewarded. detach=False reproduces RUSplatting."""
+    m = (alpha > 0.5).float()
+    mean_depth = ((depth * m).sum() / m.sum().clamp_min(1.0)).detach().clamp_min(1e-6)
+    D = depth * alpha / mean_depth
+    if detach:
+        D = D.detach()
+    wx = torch.exp(-beta * (D[:, 1:] - D[:, :-1]).abs())
+    wy = torch.exp(-beta * (D[1:] - D[:-1]).abs())
+    gx = (image[:, 1:] - image[:, :-1]).abs()
+    gy = (image[1:] - image[:-1]).abs()
+    return (gx * wx).mean() + (gy * wy).mean()
+
+
+class PerceptualLoss:
+    """LPIPS (lpips package, v0.1 linear heads) between a rendered training image and its photo.
+
+    The network is frozen (no parameter receives gradients); only the render does. Each call scores one
+    random crop x crop window, the same for both images (crop 0 = whole image), drawn from a seeded
+    generator so runs are reproducible. net="vgg" is the network the evaluation reports; net="alex" gives
+    a perceptual loss that is not the evaluation network itself."""
+
+    def __init__(self, net: str = "vgg", crop: int = 512, device="cuda", seed: int = 0):
+        import lpips
+        self.fn = lpips.LPIPS(net=net, verbose=False).to(device).eval()
+        for p in self.fn.parameters():
+            p.requires_grad_(False)
+        self.crop = crop
+        self.gen = torch.Generator().manual_seed(seed)
+
+    def window(self, H: int, W: int):
+        if not self.crop or (H <= self.crop and W <= self.crop):
+            return 0, 0, H, W
+        h, w = min(self.crop, H), min(self.crop, W)
+        y = int(torch.randint(0, H - h + 1, (1,), generator=self.gen))
+        x = int(torch.randint(0, W - w + 1, (1,), generator=self.gen))
+        return y, x, h, w
+
+    def __call__(self, pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+        """pred, gt (H, W, 3) in [0, 1] -> scalar LPIPS of the crop."""
+        y, x, h, w = self.window(*pred.shape[:2])
+        to = lambda im: im[y:y + h, x:x + w].permute(2, 0, 1)[None] * 2 - 1
+        return self.fn(to(pred), to(gt)).mean()
+
+
 # Masked means below are written without Python branches on tensor values, which would
 # force a GPU synchronisation every iteration (and an empty selection would give NaN).
 
@@ -96,3 +156,15 @@ def background_opacity(alpha, gt, binf_map, thresh=0.08):
     """Pixels the medium alone explains (|gt - B_inf(d)| small) should be left transparent."""
     m = ((gt - binf_map.detach()).norm(dim=-1, keepdim=True) < thresh).float()
     return (alpha * m).sum() / m.sum().clamp_min(1.0)
+
+
+def needle_penalty(log_scales, max_ratio=10.0):
+    """Selective shape regulariser: only Gaussians whose longest axis exceeds `max_ratio` x their middle axis
+    (needles / streaks) are penalised, by the log of the excess; every other Gaussian gets zero gradient.
+
+    Needles are how a sparse-view fit explains thin view-specific detail (caustics, particles, compression
+    noise): seen from a training camera along their short axes they are one pixel wide, from a new pose they
+    become streaks. Using the middle axis (not the smallest) leaves flat discs alone, which are the correct
+    shape for surfaces (and what the surfel initialisation creates)."""
+    s = torch.sort(log_scales, dim=-1).values          # log scales: ratio = difference
+    return F.relu(s[:, 2] - s[:, 1] - torch.log(torch.tensor(max_ratio, device=s.device))).mean()

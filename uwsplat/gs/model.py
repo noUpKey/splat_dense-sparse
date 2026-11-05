@@ -6,18 +6,39 @@ from scipy.spatial import cKDTree
 from ..common.io import write_ply
 from .sh import rgb_to_sh
 
-SPARSE, DENSE = 0, 1  # modality tags: SIFT/wreck points, dense/water points
+SPARSE, DENSE, VERIFIED = 0, 1, 2  # modality tags: SIFT points, network-only (water/completed), MVS-verified
 
 
-def init_params(xyz: np.ndarray, rgb: np.ndarray, opacity: np.ndarray, sh_degree: int, device) -> torch.nn.ParameterDict:
-    """xyz (N, 3), rgb (N, 3) restored colours in [0, 1], opacity (N,) initial opacities."""
+def normal_to_quat(n: np.ndarray) -> np.ndarray:
+    """Unit normals (N, 3) -> quaternions (w, x, y, z) of the shortest rotation taking the local z axis
+    onto each normal (gsplat convention: covariance = R diag(s)^2 R^T, so scale[2] lies along n)."""
+    n = n / np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-12)
+    q = np.stack([1.0 + n[:, 2], -n[:, 1], n[:, 0], np.zeros(len(n))], 1)
+    flip = q[:, 0] < 1e-6  # n ~ -z: rotate by pi about x
+    q[flip] = np.array([0.0, 1.0, 0.0, 0.0])
+    return q / np.linalg.norm(q, axis=1, keepdims=True)
+
+
+def init_params(xyz: np.ndarray, rgb: np.ndarray, opacity: np.ndarray, sh_degree: int, device,
+                normals: np.ndarray = None, surfel_ratio: float = 0.0) -> torch.nn.ParameterDict:
+    """xyz (N, 3), rgb (N, 3) restored colours in [0, 1], opacity (N,) initial opacities.
+
+    Scales follow 3DGS (RMS distance to the 3 nearest neighbours). With surfel_ratio > 0, points that
+    carry a surface normal (|n| > 0.5) start as flat discs on the surface: the in-plane scales keep the
+    neighbour distance, the scale along the normal is surfel_ratio times it."""
     d, _ = cKDTree(xyz).query(xyz, k=4)
     dist = np.sqrt(np.mean(d[:, 1:] ** 2, 1)).clip(1e-7)  # 3DGS: RMS distance to the 3 nearest neighbours
     n = len(xyz)
+    scales = np.repeat(dist[:, None], 3, 1)
+    quats = np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (n, 1))
+    if normals is not None and surfel_ratio > 0:
+        has = np.linalg.norm(normals, axis=1) > 0.5
+        quats[has] = normal_to_quat(normals[has])
+        scales[has, 2] *= surfel_ratio
     p = {
         "means": torch.tensor(xyz, dtype=torch.float32),
-        "scales": torch.log(torch.tensor(dist, dtype=torch.float32))[:, None].repeat(1, 3),
-        "quats": torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(n, 1),
+        "scales": torch.log(torch.tensor(scales, dtype=torch.float32)),
+        "quats": torch.tensor(quats, dtype=torch.float32),
         "opacities": torch.logit(torch.tensor(opacity, dtype=torch.float32).clamp(1e-4, 1 - 1e-4)),
         "sh0": rgb_to_sh(torch.tensor(rgb, dtype=torch.float32))[:, None],
     }
