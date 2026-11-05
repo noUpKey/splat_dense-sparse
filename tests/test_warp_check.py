@@ -54,10 +54,13 @@ def main():
     dA, db = 0.1 * torch.randn(3, 3), 0.05 * torch.randn(3)
     assert torch.allclose(wc.inverse_affine(apply_affine(x, dA, db), dA, db), x, atol=1e-5)
 
+    a16, b16 = torch.rand(16, 16, 3), torch.rand(16, 16, 3)
+    rng = torch.get_rng_state()     # building the LPIPS net draws random init weights: keep the toy's stream unchanged
     try:
-        wc.lpips(torch.rand(16, 16, 3), torch.rand(16, 16, 3))
+        wc.lpips(a16, b16)
     except Exception:
         wc.lpips = lambda a, b, net="vgg": 0.0          # no network weights offline
+    torch.set_rng_state(rng)
 
     true_p, flat_p = plane_params(True), plane_params(False)
     medium = WaterMedium(np.array([0.25, 0.35, 0.45]), np.array([0.20, 0.30, 0.40]), np.array([0.25, 0.20, 0.15]), 1)
@@ -112,12 +115,21 @@ def main():
         dec = wc.decide({"toy": s})
         assert dec["physics"] and dec["detail_psnr"] and dec["build_network"], dec
 
-        # overlap source selection + identity target colour runs too (photo-collection mode)
+        # photo-collection mode (overlap sources, identity target colour). How it scores depends on how far the
+        # unknown test camera is from identity (seed-dependent), so the ordering is checked on a test photo that
+        # really was taken with the identity camera, the case this mode assumes
         res2 = wc.run(d, "toy", device="cpu", backend="torch", sources="overlap", target_colour="identity",
                       save_images=False)
-        m2 = res2["summary"]["masked"]
         assert res2["summary"]["n_views"] == 1
-        assert m2["camera"]["psnr"] > m2["naive"]["psnr"] + 3, m2      # source camera removed
+        tv = views[splits.index("test")]
+        img = render_variant(true_p, tv, medium, 0, "torch", None, "base")["image"]
+        save_rgb(os.path.join(d, "images", tv.stem + ".png"), (img.clamp(0, 1).numpy() * 255 + 0.5).astype(np.uint8))
+        m3 = wc.run(d, "toy", device="cpu", backend="torch", sources="overlap", target_colour="identity",
+                    save_images=False)["summary"]["masked"]
+        print("identity-camera test photo:", {k: round(v["psnr"], 2) for k, v in m3.items()})
+        assert m3["camera"]["psnr"] > m3["naive"]["psnr"] + 3, m3       # source camera removed
+        assert m3["camera_water"]["psnr"] > m3["camera"]["psnr"] + 3, m3  # water transferred
+        assert m3["camera_water"]["psnr"] > 35, m3
     print("warp check test passed")
 
 
